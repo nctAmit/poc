@@ -1,0 +1,56 @@
+// Build “solid rectangles” (grid cell → 2 triangles) using only 6 indices (no vertex duplication)
+function buildSolidRectGrid(grid, positionsAll, colorsAll, indexMap, width, height) {
+  // Count triangles
+  let triCount = 0;
+  for (let y = 0; y < height - 1; y++) {
+    for (let x = 0; x < width - 1; x++) {
+      const tl = y * width + x;
+      const tr = tl + 1;
+      const bl = (y + 1) * width + x;
+      const br = bl + 1;
+      if (
+        indexMap[tl] !== -1 &&
+        indexMap[tr] !== -1 &&
+        indexMap[bl] !== -1 &&
+        indexMap[br] !== -1
+      ) {
+        triCount += 2; // 2 triangles per quad
+      }
+    }
+  }
+
+  const outIndices = new Uint32Array(triCount * 3); // 3 indices per triangle
+  let idx = 0;
+
+  for (let y = 0; y < height - 1; y++) {
+    for (let x = 0; x < width - 1; x++) {
+      const tl = y * width + x;
+      const tr = tl + 1;
+      const bl = (y + 1) * width + x;
+      const br = bl + 1;
+
+      const i0 = indexMap[tl];
+      const i1 = indexMap[bl];
+      const i2 = indexMap[br];
+      const i3 = indexMap[tr];
+
+      if (i0 === -1 || i1 === -1 || i2 === -1 || i3 === -1) continue;
+
+      // Two triangles: (i0, i1, i2), (i0, i2, i3)
+      outIndices[idx++] = i0;
+      outIndices[idx++] = i1;
+      outIndices[idx++] = i2;
+
+      outIndices[idx++] = i0;
+      outIndices[idx++] = i2;
+      outIndices[idx++] = i3;
+    }
+  }
+
+  // We don’t need to rebuild positions/colors because they are already in posArr/colArr
+  return {
+    outPositions: positionsAll,
+    outColors: colorsAll,
+    outIndices
+  };
+}
