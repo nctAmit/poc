@@ -1,10 +1,72 @@
-function buildSmoothGrid(positionsAll, colorsAll, indexMap, width, height, subdivisions = 4) {
-    const outPositions = [];
-    const outColors = [];
-    const outIndices = [];
+/* meshWorker.js */
+/* CPU-bound pipeline:
+   - Parse GeoTIFF
+   - Build smooth grid (bilinear + subdivisions)
+   - Apply Laplacian smoothing (on z)
+   - Compute normals
+   Returns typed arrays via Transferables
+*/
 
-    let vertexIndex = 0;
+self.importScripts('https://cdn.jsdelivr.net/npm/geotiff');
+
+const NODATA_ELEV = -99999;
+
+// ----- Normals (per-vertex, accumulated from triangle faces) -----
+function computeNormals(positions /* Float64Array */, indices /* Uint32Array */) {
+    const n = positions.length / 3;
+    const normals = new Float32Array(positions.length); // 3 per vertex
+
+    for (let i = 0; i < indices.length; i += 3) {
+        const ia = indices[i] * 3;
+        const ib = indices[i + 1] * 3;
+        const ic = indices[i + 2] * 3;
+
+        const ax = positions[ia], ay = positions[ia + 1], az = positions[ia + 2];
+        const bx = positions[ib], by = positions[ib + 1], bz = positions[ib + 2];
+        const cx = positions[ic], cy = positions[ic + 1], cz = positions[ic + 2];
+
+        // edges
+        const e1x = bx - ax, e1y = by - ay, e1z = bz - az;
+        const e2x = cx - ax, e2y = cy - ay, e2z = cz - az;
+
+        // face normal = e1 x e2
+        const nx = e1y * e2z - e1z * e2y;
+        const ny = e1z * e2x - e1x * e2z;
+        const nz = e1x * e2y - e1y * e2x;
+
+        normals[ia] += nx; normals[ia + 1] += ny; normals[ia + 2] += nz;
+        normals[ib] += nx; normals[ib + 1] += ny; normals[ib + 2] += nz;
+        normals[ic] += nx; normals[ic + 1] += ny; normals[ic + 2] += nz;
+    }
+
+    // normalize
+    for (let i = 0; i < normals.length; i += 3) {
+        const nx = normals[i], ny = normals[i + 1], nz = normals[i + 2];
+        const len = Math.hypot(nx, ny, nz);
+        if (len > 0) {
+            normals[i] = nx / len;
+            normals[i + 1] = ny / len;
+            normals[i + 2] = nz / len;
+        }
+    }
+    return normals;
+}
+
+// ----- Build smooth subdivided grid globally -----
+function buildSmoothGlobalGrid(positionsAll, colorsAll, indexMap, width, height, subdivisions = 4) {
+    const gw = (width - 1) * subdivisions + 1;   // global grid width
+    const gh = (height - 1) * subdivisions + 1;  // global grid height
+    const N = gw * gh;
+
+    // Accumulate
+    const posSum = new Float64Array(N * 3);
+    const colSum = new Float64Array(N * 4);
+    const wSum   = new Uint16Array(N);
+
     const step = 1 / subdivisions;
+
+    const p = (idx) => [positionsAll[idx*3], positionsAll[idx*3+1], positionsAll[idx*3+2]];
+    const c = (idx) => [colorsAll[idx*4], colorsAll[idx*4+1], colorsAll[idx*4+2], colorsAll[idx*4+3]];
 
     for (let y = 0; y < height - 1; y++) {
         for (let x = 0; x < width - 1; x++) {
@@ -12,73 +74,218 @@ function buildSmoothGrid(positionsAll, colorsAll, indexMap, width, height, subdi
             const iTR = indexMap[y * width + (x + 1)];
             const iBL = indexMap[(y + 1) * width + x];
             const iBR = indexMap[(y + 1) * width + (x + 1)];
-
             if (iTL === -1 || iTR === -1 || iBL === -1 || iBR === -1) continue;
 
-            // corner positions
-            const pTL = [positionsAll[iTL * 3], positionsAll[iTL * 3 + 1], positionsAll[iTL * 3 + 2]];
-            const pTR = [positionsAll[iTR * 3], positionsAll[iTR * 3 + 1], positionsAll[iTR * 3 + 2]];
-            const pBL = [positionsAll[iBL * 3], positionsAll[iBL * 3 + 1], positionsAll[iBL * 3 + 2]];
-            const pBR = [positionsAll[iBR * 3], positionsAll[iBR * 3 + 1], positionsAll[iBR * 3 + 2]];
+            const pTL = p(iTL), pTR = p(iTR), pBL = p(iBL), pBR = p(iBR);
+            const cTL = c(iTL), cTR = c(iTR), cBL = c(iBL), cBR = c(iBR);
 
-            // simple color (average or TL only)
-            const color = [
-                colorsAll[iTL * 4],
-                colorsAll[iTL * 4 + 1],
-                colorsAll[iTL * 4 + 2],
-                colorsAll[iTL * 4 + 3]
-            ];
-
-            // Build a (subdivisions+1) x (subdivisions+1) grid inside the cell
-            const grid = [];
             for (let j = 0; j <= subdivisions; j++) {
+                const v = j * step;
                 for (let i = 0; i <= subdivisions; i++) {
-                    const u = i * step; // 0..1
-                    const v = j * step; // 0..1
+                    const u = i * step;
 
-                    // bilinear interpolation of elevation & position
-                    const xTop = [
-                        pTL[0] * (1 - u) + pTR[0] * u,
-                        pTL[1] * (1 - u) + pTR[1] * u,
-                        pTL[2] * (1 - u) + pTR[2] * u
-                    ];
-                    const xBottom = [
-                        pBL[0] * (1 - u) + pBR[0] * u,
-                        pBL[1] * (1 - u) + pBR[1] * u,
-                        pBL[2] * (1 - u) + pBR[2] * u
-                    ];
+                    // bilinear interpolation
+                    const wTL = (1 - u) * (1 - v);
+                    const wTR = (u)     * (1 - v);
+                    const wBL = (1 - u) * (v);
+                    const wBR = (u)     * (v);
 
-                    const pos = [
-                        xTop[0] * (1 - v) + xBottom[0] * v,
-                        xTop[1] * (1 - v) + xBottom[1] * v,
-                        xTop[2] * (1 - v) + xBottom[2] * v
-                    ];
+                    const px = pTL[0]*wTL + pTR[0]*wTR + pBL[0]*wBL + pBR[0]*wBR;
+                    const py = pTL[1]*wTL + pTR[1]*wTR + pBL[1]*wBL + pBR[1]*wBR;
+                    const pz = pTL[2]*wTL + pTR[2]*wTR + pBL[2]*wBL + pBR[2]*wBR;
 
-                    grid.push(vertexIndex);
-                    outPositions.push(...pos);
-                    outColors.push(...color);
-                    vertexIndex++;
-                }
-            }
+                    const cr = cTL[0]*wTL + cTR[0]*wTR + cBL[0]*wBL + cBR[0]*wBR;
+                    const cg = cTL[1]*wTL + cTR[1]*wTR + cBL[1]*wBL + cBR[1]*wBR;
+                    const cb = cTL[2]*wTL + cTR[2]*wTR + cBL[2]*wBL + cBR[2]*wBR;
+                    const ca = cTL[3]*wTL + cTR[3]*wTR + cBL[3]*wBL + cBR[3]*wBR;
 
-            // Triangulate subgrid
-            for (let j = 0; j < subdivisions; j++) {
-                for (let i = 0; i < subdivisions; i++) {
-                    const i0 = grid[j * (subdivisions + 1) + i];
-                    const i1 = grid[j * (subdivisions + 1) + (i + 1)];
-                    const i2 = grid[(j + 1) * (subdivisions + 1) + i];
-                    const i3 = grid[(j + 1) * (subdivisions + 1) + (i + 1)];
+                    const gx = x * subdivisions + i;
+                    const gy = y * subdivisions + j;
+                    const gIdx = gy * gw + gx;
 
-                    outIndices.push(i0, i1, i2);
-                    outIndices.push(i2, i1, i3);
+                    posSum[gIdx*3]   += px;
+                    posSum[gIdx*3+1] += py;
+                    posSum[gIdx*3+2] += pz;
+                    colSum[gIdx*4]   += cr;
+                    colSum[gIdx*4+1] += cg;
+                    colSum[gIdx*4+2] += cb;
+                    colSum[gIdx*4+3] += ca;
+                    wSum[gIdx]       += 1;
                 }
             }
         }
     }
 
+    // Finalize
+    const outPositions = new Float64Array(N * 3);
+    const outColors    = new Uint8Array(N * 4);
+    const valid        = new Uint8Array(N);
+
+    for (let i = 0; i < N; i++) {
+        const w = wSum[i];
+        if (w > 0) {
+            outPositions[i*3]   = posSum[i*3]   / w;
+            outPositions[i*3+1] = posSum[i*3+1] / w;
+            outPositions[i*3+2] = posSum[i*3+2] / w;
+
+            outColors[i*4]   = Math.round(colSum[i*4]   / w);
+            outColors[i*4+1] = Math.round(colSum[i*4+1] / w);
+            outColors[i*4+2] = Math.round(colSum[i*4+2] / w);
+            outColors[i*4+3] = Math.round(colSum[i*4+3] / w);
+
+            valid[i] = 1;
+        }
+    }
+
+    // Triangles
+    const outIndices = [];
+    const idx = (x, y) => y * gw + x;
+    for (let y = 0; y < gh - 1; y++) {
+        for (let x = 0; x < gw - 1; x++) {
+            const i0 = idx(x, y);
+            const i1 = idx(x+1, y);
+            const i2 = idx(x, y+1);
+            const i3 = idx(x+1, y+1);
+
+            if (valid[i0] && valid[i1] && valid[i2]) outIndices.push(i0, i1, i2);
+            if (valid[i2] && valid[i1] && valid[i3]) outIndices.push(i2, i1, i3);
+        }
+    }
+
     return {
-        outPositions: new Float64Array(outPositions),
-        outColors: new Uint8Array(outColors),
+        outPositions,
+        outColors,
         outIndices: new Uint32Array(outIndices)
     };
 }
+
+// ----- Laplacian smoothing (on z only) -----
+function buildAdjacency(nVerts, indices) {
+    const nbrs = Array.from({ length: nVerts }, () => new Set());
+    for (let i = 0; i < indices.length; i += 3) {
+        const a = indices[i], b = indices[i+1], c = indices[i+2];
+        nbrs[a].add(b); nbrs[a].add(c);
+        nbrs[b].add(a); nbrs[b].add(c);
+        nbrs[c].add(a); nbrs[c].add(b);
+    }
+    return nbrs;
+}
+
+function laplacianSmoothZ(positions, indices, iterations = 2, alpha = 0.45, preserveEdges = true) {
+    const n = positions.length / 3;
+    const nbrs = buildAdjacency(n, indices);
+
+    const isBoundary = new Uint8Array(n);
+    if (preserveEdges) {
+        for (let i = 0; i < n; i++) {
+            if (nbrs[i].size < 6) isBoundary[i] = 1;
+        }
+    }
+
+    const z = new Float64Array(n);
+    for (let i = 0; i < n; i++) z[i] = positions[i*3+2];
+    const newZ = new Float64Array(n);
+
+    for (let it = 0; it < iterations; it++) {
+        for (let i = 0; i < n; i++) {
+            if (preserveEdges && isBoundary[i]) {
+                newZ[i] = z[i];
+                continue;
+            }
+            let sum = 0;
+            nbrs[i].forEach(j => { sum += z[j]; });
+            const avg = sum / nbrs[i].size;
+            newZ[i] = (1 - alpha) * z[i] + alpha * avg;
+        }
+        z.set(newZ);
+    }
+    for (let i = 0; i < n; i++) positions[i*3+2] = z[i];
+}
+
+// ----- Worker handler -----
+self.onmessage = async (e) => {
+    const { id, type, payload } = e.data || {};
+    try {
+        if (type === 'PROCESS_TIFF') {
+            const { arrayBuffer, deltaZ = 0 } = payload;
+
+            const tiff = await GeoTIFF.fromArrayBuffer(arrayBuffer);
+            const image = await tiff.getImage();
+            const rasters = await image.readRasters(); // [0]=elev, [1]=R, [2]=G, [3]=B
+            const width = image.getWidth();
+            const height = image.getHeight();
+
+            const bbox = image.getBoundingBox();
+
+            const elev = rasters[0];
+            const R = rasters[1], G = rasters[2], B = rasters[3];
+
+            const positions = [];
+            const colors = [];
+            const indexMap = new Int32Array(width * height);
+            indexMap.fill(-1);
+
+            let nextIdx = 0;
+            for (let y = 0; y < height; y++) {
+                for (let x = 0; x < width; x++) {
+                    const i = y * width + x;
+
+                    let h = (elev[i] === NODATA_ELEV) ? 0 : Number(elev[i]);
+                    let r = Number(R[i]), g = Number(G[i]), b = Number(B[i]);
+                    let a = 255;
+
+                    if (h === 0) {
+                        h = 0;
+                        a = 100;
+                        r = 255; g = 255; b = 255;
+                    } else {
+                        h += Number(deltaZ || 0);
+                    }
+
+                    if (h > 0) {
+                        // keep coords in (lat, lon, z) order
+                        positions.push(x, y, h); 
+                        colors.push(r, g, b, a);
+                        indexMap[i] = nextIdx++;
+                    }
+                }
+            }
+
+            const posArr = new Float64Array(positions);
+            const colArr = new Uint8Array(colors);
+
+            // Build smooth mesh
+            const { outPositions, outColors, outIndices } =
+                buildSmoothGlobalGrid(posArr, colArr, indexMap, width, height, 6);
+
+            // Smooth z
+            laplacianSmoothZ(outPositions, outIndices, 2, 0.45, true);
+
+            // Normals
+            const normals = computeNormals(outPositions, outIndices);
+
+            self.postMessage({
+                id,
+                ok: true,
+                result: {
+                    width,
+                    height,
+                    bbox,
+                    positions: outPositions.buffer,
+                    colors: outColors.buffer,
+                    indices: outIndices.buffer,
+                    normals: normals.buffer
+                }
+            }, [outPositions.buffer, outColors.buffer, outIndices.buffer, normals.buffer]);
+
+        } else {
+            throw new Error(`Unknown worker message type: ${type}`);
+        }
+    } catch (err) {
+        self.postMessage({
+            id,
+            ok: false,
+            error: (err && err.message) || String(err)
+        });
+    }
+};
