@@ -1,0 +1,283 @@
+/* meshWorker.js */
+/* CPU-bound pipeline:
+   - Parse GeoTIFF
+   - Build positions/colors/indices (solid quads → two triangles)
+   - Compute normals
+   Returns typed arrays via Transferables
+*/
+
+self.importScripts('https://cdn.jsdelivr.net/npm/geotiff');
+
+const NODATA_ELEV = -99999;
+
+// ----- WGS84 to ECEF (so we don’t need Cesium in worker) -----
+function degToRad(d) { return d * Math.PI / 180; }
+
+// ----- Normals (per-vertex, accumulated from triangle faces) -----
+function computeNormals(positions /* Float64Array */, indices /* Uint32Array */) {
+    const n = positions.length / 3;
+    const normals = new Float32Array(positions.length); // 3 per vertex
+    // zero init by default
+
+    for (let i = 0; i < indices.length; i += 3) {
+        const ia = indices[i] * 3;
+        const ib = indices[i + 1] * 3;
+        const ic = indices[i + 2] * 3;
+
+        const ax = positions[ia], ay = positions[ia + 1], az = positions[ia + 2];
+        const bx = positions[ib], by = positions[ib + 1], bz = positions[ib + 2];
+        const cx = positions[ic], cy = positions[ic + 1], cz = positions[ic + 2];
+
+        // edges
+        const e1x = bx - ax, e1y = by - ay, e1z = bz - az;
+        const e2x = cx - ax, e2y = cy - ay, e2z = cz - az;
+
+        // face normal = e1 x e2
+        const nx = e1y * e2z - e1z * e2y;
+        const ny = e1z * e2x - e1x * e2z;
+        const nz = e1x * e2y - e1y * e2x;
+
+        normals[ia] += nx; normals[ia + 1] += ny; normals[ia + 2] += nz;
+        normals[ib] += nx; normals[ib + 1] += ny; normals[ib + 2] += nz;
+        normals[ic] += nx; normals[ic + 1] += ny; normals[ic + 2] += nz;
+    }
+
+    // normalize
+    for (let i = 0; i < normals.length; i += 3) {
+        const nx = normals[i], ny = normals[i + 1], nz = normals[i + 2];
+        const len = Math.hypot(nx, ny, nz);
+        if (len > 0) {
+            normals[i] = nx / len;
+            normals[i + 1] = ny / len;
+            normals[i + 2] = nz / len;
+        }
+    }
+    return normals;
+}
+
+// Build “solid rectangles” (grid cell → 2 triangles) using only 6 indices (no vertex duplication)
+function buildSolidRectGrid(grid, positionsAll, colorsAll, indexMap, width, height) {
+
+
+
+    const outPositions = [];
+    const outColors = [];
+    const outIndices = [];
+
+    let vertexIndex = 0;
+    const subdivisions = 4; // Increase for smoother mesh
+    const step = 1 / subdivisions;
+
+    for (let y = 0; y < height - 1; y++) {
+        for (let x = 0; x < width - 1; x++) {
+            const iTL = indexMap[y * width + x];
+            const iTR = indexMap[y * width + (x + 1)];
+            const iBL = indexMap[(y + 1) * width + x];
+            const iBR = indexMap[(y + 1) * width + (x + 1)];
+
+            if (iTL === -1 || iTR === -1 || iBL === -1 || iBR === -1) continue;
+
+            const pTL = [positionsAll[iTL * 3], positionsAll[iTL * 3 + 1], positionsAll[iTL * 3 + 2]];
+            const pTR = [positionsAll[iTR * 3], positionsAll[iTR * 3 + 1], positionsAll[iTR * 3 + 2]];
+            const pBL = [positionsAll[iBL * 3], positionsAll[iBL * 3 + 1], positionsAll[iBL * 3 + 2]];
+            const pBR = [positionsAll[iBR * 3], positionsAll[iBR * 3 + 1], positionsAll[iBR * 3 + 2]];
+
+            const color = [
+                colorsAll[iTL * 4],
+                colorsAll[iTL * 4 + 1],
+                colorsAll[iTL * 4 + 2],
+                colorsAll[iTL * 4 + 3]
+            ];
+
+            // Compute center point with interpolated elevation
+            const center = [
+                (pTL[0] + pTR[0] + pBL[0] + pBR[0]) / 4,
+                (pTL[1] + pTR[1] + pBL[1] + pBR[1]) / 4,
+                (pTL[2] + pTR[2] + pBL[2] + pBR[2]) / 4
+            ];
+
+            // Create triangles from center to corners
+            const topTriangles = [
+                [center, pTL, pTR],
+                [center, pTR, pBR],
+                [center, pBR, pBL],
+                [center, pBL, pTL]
+            ];
+
+            for (const tri of topTriangles) {
+                for (const v of tri) {
+                    outPositions.push(...v);
+                    outColors.push(...color);
+                    outIndices.push(vertexIndex++);
+                }
+            }
+
+
+
+
+            for (let i = 0; i < subdivisions; i++) {
+                for (let j = 0; j < subdivisions; j++) {
+                    const u0 = i * step;
+                    const v0 = j * step;
+                    const u1 = (i + 1) * step;
+                    const v1 = (j + 1) * step;
+
+                    const interpolate = (u, v) => {
+                        const top = [
+                            pTL[0] * (1 - u) + pTR[0] * u,
+                            pTL[1] * (1 - u) + pTR[1] * u,
+                            pTL[2] * (1 - u) + pTR[2] * u
+                        ];
+                        const bottom = [
+                            pBL[0] * (1 - u) + pBR[0] * u,
+                            pBL[1] * (1 - u) + pBR[1] * u,
+                            pBL[2] * (1 - u) + pBR[2] * u
+                        ];
+                        const base = [
+                            top[0] * (1 - v) + bottom[0] * v,
+                            top[1] * (1 - v) + bottom[1] * v,
+                            top[2] * (1 - v) + bottom[2] * v
+                        ];
+
+                        // Elevation adjustment based on gradient
+                        const dzdx = (pTR[2] - pTL[2] + pBR[2] - pBL[2]) / 2;
+                        const dzdy = (pBL[2] - pTL[2] + pBR[2] - pTR[2]) / 2;
+
+                        // Linear interpolation of elevation from corners
+                        const zTop = pTL[2] * (1 - u) + pTR[2] * u;
+                        const zBottom = pBL[2] * (1 - u) + pBR[2] * u;
+                        const zInterpolated = zTop * (1 - v) + zBottom * v;
+                        base[2] = zInterpolated;
+
+                        return base;
+                    };
+
+                    const p0 = interpolate(u0, v0);
+                    const p1 = interpolate(u1, v0);
+                    const p2 = interpolate(u0, v1);
+                    const p3 = interpolate(u1, v1);
+
+                    const triangles = [
+                        [p0, p1, p2],
+                        [p2, p1, p3]
+                    ];
+
+                    for (const tri of triangles) {
+                        for (const v of tri) {
+                            outPositions.push(...v);
+                            outColors.push(...color);
+                            outIndices.push(vertexIndex++);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return {
+        outPositions: new Float64Array(outPositions),
+        outColors: new Uint8Array(outColors),
+        outIndices: new Uint32Array(outIndices)
+    };
+
+}
+
+
+
+function webMercatorToLonLat(x, y) {
+    const R = 6378137.0;
+    const lon = (x / R) * (180 / Math.PI);
+    const lat = (2 * Math.atan(Math.exp(y / R)) - Math.PI / 2) * (180 / Math.PI);
+    return [lon, lat];
+}
+
+self.onmessage = async (e) => {
+    const { id, type, payload } = e.data || {};
+    try {
+        if (type === 'PROCESS_TIFF') {
+            const { arrayBuffer, deltaZ = 0 } = payload;
+
+            const tiff = await GeoTIFF.fromArrayBuffer(arrayBuffer);
+            const image = await tiff.getImage();
+            const rasters = await image.readRasters(); // [0]=elev, [1]=R, [2]=G, [3]=B (as in your pipeline)
+            const width = image.getWidth();
+            const height = image.getHeight();
+
+            const bbox = image.getBoundingBox(); // [minX, minY, maxX, maxY]
+            const minX = bbox[0], minY = bbox[1], maxX = bbox[2], maxY = bbox[3];
+            const lonStep = (maxX - minX) / (width - 1 || 1);
+            const latStep = (maxY - minY) / (height - 1 || 1);
+
+            const elev = rasters[0];
+            const R = rasters[1], G = rasters[2], B = rasters[3];
+
+            // Build sparse vertex map (skip nodata / zero elev)
+            const positions = [];
+            const colors = [];
+            const indexMap = new Int32Array(width * height);
+            indexMap.fill(-1);
+
+            let nextIdx = 0;
+
+            for (let y = 0; y < height; y++) {
+                const lat = maxY - y * latStep;
+                for (let x = 0; x < width; x++) {
+                    const lon = minX + x * lonStep;
+                    const i = y * width + x;
+
+                    let h = (elev[i] === NODATA_ELEV) ? 0 : Number(elev[i]);
+                    let r = Number(R[i]), g = Number(G[i]), b = Number(B[i]);
+                    let a = 255;
+
+                    if (h === 0) {
+                        // transparent white for no-elev
+                        h = 0;
+                        a = 100;
+                        r = 255; g = 255; b = 255;
+                    } else {
+                        h += Number(deltaZ || 0);
+                    }
+
+                    if (h > 0) {
+                        positions.push(lat, lon, h);
+                        colors.push(r, g, b, a);
+                        indexMap[i] = nextIdx++;
+                    }
+                }
+            }
+
+            const posArr = new Float64Array(positions);
+            const colArr = new Uint8Array(colors);
+
+            // Solid rectangles (quads)
+            const { outPositions, outColors, outIndices } =
+                buildSolidRectGrid({ width, height }, posArr, colArr, indexMap, width, height);
+
+            const normals = computeNormals(outPositions, outIndices);
+
+            // Prepare result (use transferables to avoid copying)
+            self.postMessage({
+                id,
+                ok: true,
+                result: {
+                    width,
+                    height,
+                    bbox, // [minX, minY, maxX, maxY] (degrees if source is EPSG:4326)
+                    positions: outPositions.buffer,
+                    colors: outColors.buffer,
+                    indices: outIndices.buffer,
+                    normals: normals.buffer
+                }
+            }, [outPositions.buffer, outColors.buffer, outIndices.buffer, normals.buffer]);
+
+        } else {
+            throw new Error(`Unknown worker message type: ${type}`);
+        }
+    } catch (err) {
+        self.postMessage({
+            id,
+            ok: false,
+            error: (err && err.message) || String(err)
+        });
+    }
+};
