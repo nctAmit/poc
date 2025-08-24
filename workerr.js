@@ -2,8 +2,9 @@
    - Parse GeoTIFF
    - Build a mesh on the GRID-CENTER lattice:
        centers = (width-1) x (height-1)
-       triangles connect adjacent centers (2 per quad)
-   - Vertex color by elevation (red→blue), optional hillshade baked
+       triangles connect adjacent centers (2 per 4-center quad)
+   - Vertex color from GeoTIFF RGB(A) averaged from the 4 surrounding samples
+   - Optional hillshade baked into those colors
    - Compute normals
    - Returns typed arrays via Transferables
 */
@@ -15,17 +16,6 @@ const NODATA_ELEV = -99999;
 const clamp01 = v => Math.max(0, Math.min(1, v));
 const clamp255 = v => Math.max(0, Math.min(255, v | 0));
 const degToRad = d => d * Math.PI / 180;
-
-// red→blue ramp with optional gamma + invert
-function elevToColor(h, minH, maxH, { colorInvert = false, gamma = 1.0 } = {}) {
-  if (!isFinite(h) || maxH <= minH) return [200, 200, 200];
-  let t = (h - minH) / (maxH - minH);
-  t = clamp01(t);
-  if (gamma && gamma !== 1) t = Math.pow(t, gamma);
-  if (colorInvert) t = 1 - t;
-  const r = 255 * (1 - t), g = 0, b = 255 * t;
-  return [r | 0, g, b | 0];
-}
 
 function hillshadeFromNormal(nx, ny, nz, Lx, Ly, Lz) {
   return 0.25 + 0.75 * clamp01(nx * Lx + ny * Ly + nz * Lz);
@@ -55,25 +45,10 @@ function computeNormals(positions, indices) {
   return normals;
 }
 
-function computeElevRange(elev, treatZeroAsNoData) {
-  let minH = +Infinity, maxH = -Infinity, any = false;
-  for (let i = 0; i < elev.length; i++) {
-    const h = elev[i];
-    if (h === NODATA_ELEV) continue;
-    if (treatZeroAsNoData && h === 0) continue;
-    if (!isFinite(h)) continue;
-    if (h < minH) minH = h;
-    if (h > maxH) maxH = h;
-    any = true;
-  }
-  if (!any) { minH = 0; maxH = 1; }
-  if (maxH === minH) maxH = minH + 1e-6;
-  return { minH, maxH };
-}
-
 // Per-grid hillshade (used only to modulate vertex color if shadeStrength>0)
 function computeGridHillshade(elev, width, height, minLon, maxLon, minLat, maxLat, zExaggeration, sunAzimuthDeg, sunAltitudeDeg) {
   const out = new Float32Array(width * height);
+
   const latMid = (minLat + maxLat) * 0.5;
   const mPerDegLat = 110540;
   const mPerDegLon = 111320 * Math.cos(degToRad(latMid));
@@ -110,15 +85,15 @@ function computeGridHillshade(elev, width, height, minLon, maxLon, minLat, maxLa
   return out;
 }
 
-// ------------- Build mesh on center lattice -------------
+// ------------- Build mesh on center lattice using GeoTIFF colors -------------
 function buildCenterLatticeMesh({
   width, height,
   minLon, maxLon, minLat, maxLat,
-  elev, zExaggeration,
+  elev, R, G, B, A,
+  zExaggeration,
   treatZeroAsNoData,
-  colorParams, hsGrid, shadeStrength
+  hsGrid, shadeStrength
 }) {
-  // centers grid size
   const cw = width - 1;
   const ch = height - 1;
   if (cw <= 0 || ch <= 0) {
@@ -131,15 +106,14 @@ function buildCenterLatticeMesh({
 
   const lonStep = (maxLon - minLon) / (width - 1 || 1);
   const latStep = (maxLat - minLat) / (height - 1 || 1);
-  const centerLonStep = lonStep; // center at mid of cell => same spacing
-  const centerLatStep = latStep;
 
   const idx = (x, y) => y * width + x;
   const cidx = (x, y) => y * cw + x;
 
-  // Prepare center elevation & validity
+  // Center attributes
   const centerH = new Float64Array(cw * ch);
   const centerValid = new Uint8Array(cw * ch);
+  const centerColor = new Uint8Array(cw * ch * 4);
 
   for (let y = 0; y < ch; y++) {
     for (let x = 0; x < cw; x++) {
@@ -150,81 +124,92 @@ function buildCenterLatticeMesh({
 
       const hTL = elev[tl], hTR = elev[tr], hBL = elev[bl], hBR = elev[br];
 
-      // A center is valid only if all 4 surrounding samples are valid
       const valid =
         hTL !== NODATA_ELEV && hTR !== NODATA_ELEV &&
         hBL !== NODATA_ELEV && hBR !== NODATA_ELEV &&
         !(treatZeroAsNoData && (hTL === 0 || hTR === 0 || hBL === 0 || hBR === 0));
 
-      if (valid) {
-        const h = (hTL + hTR + hBL + hBR) * 0.25;
-        centerH[cidx(x, y)] = h * zExaggeration;
-        centerValid[cidx(x, y)] = 1;
-      } else {
-        centerH[cidx(x, y)] = 0;
-        centerValid[cidx(x, y)] = 0;
+      const iC = cidx(x, y);
+
+      if (!valid) {
+        centerValid[iC] = 0;
+        centerH[iC] = 0;
+        // color left uninitialized; vertex will be skipped anyway
+        continue;
       }
+
+      const h = (hTL + hTR + hBL + hBR) * 0.25 * zExaggeration;
+      centerH[iC] = h;
+      centerValid[iC] = 1;
+
+      // Average GeoTIFF color (use 4-band RGBA if available, else RGB with A=255)
+      const r = ((R[tl] + R[tr] + R[bl] + R[br]) * 0.25) | 0;
+      const g = ((G[tl] + G[tr] + G[bl] + G[br]) * 0.25) | 0;
+      const b = ((B[tl] + B[tr] + B[bl] + B[br]) * 0.25) | 0;
+      const a = A ? ((A[tl] + A[tr] + A[bl] + A[br]) * 0.25) | 0 : 255;
+
+      const o = iC * 4;
+      centerColor[o] = r;
+      centerColor[o + 1] = g;
+      centerColor[o + 2] = b;
+      centerColor[o + 3] = a;
     }
   }
 
-  // Build vertex arrays (one vertex per valid center)
   const positions = [];
   const colors = [];
   const map = new Int32Array(cw * ch);
   map.fill(-1);
 
-  const shade = (r, g, b, hs) => {
+  const modulateWithShade = (r, g, b, hs) => {
     if (!shadeStrength) return [r, g, b];
     const s = clamp01(shadeStrength);
     const lit = hs * 255;
-    const nr = clamp255((1 - s) * r + s * lit);
-    const ng = clamp255((1 - s) * g + s * lit);
-    const nb = clamp255((1 - s) * b + s * lit);
-    return [nr, ng, nb];
+    return [
+      clamp255((1 - s) * r + s * lit),
+      clamp255((1 - s) * g + s * lit),
+      clamp255((1 - s) * b + s * lit)
+    ];
   };
 
   let nextV = 0;
   for (let y = 0; y < ch; y++) {
-    // center latitude = average of two row lats
     const latC = ( (maxLat - y * latStep) + (maxLat - (y + 1) * latStep) ) * 0.5;
     for (let x = 0; x < cw; x++) {
-      // center longitude = average of two column lons
       const lonC = ( (minLon + x * lonStep) + (minLon + (x + 1) * lonStep) ) * 0.5;
+      const iC = cidx(x, y);
+      if (!centerValid[iC]) { map[iC] = -1; continue; }
 
-      const i = cidx(x, y);
-      if (!centerValid[i]) { map[i] = -1; continue; }
-
-      const h = centerH[i];
+      const h = centerH[iC];
       positions.push(latC, lonC, h);
 
-      // Color by center elevation; note we pass the *pre-exaggeration* range scaled by zExaggeration to be consistent.
-      // You can also feed already-scaled min/max from outside if preferred.
-      let [r, g, b] = elevToColor(h, colorParams.minH * zExaggeration, colorParams.maxH * zExaggeration, colorParams);
+      let r = centerColor[iC*4], g = centerColor[iC*4+1], b = centerColor[iC*4+2], a = centerColor[iC*4+3];
 
       // Approx hillshade at center = average of the 4 surrounding sample hillshades (if available)
       if (hsGrid) {
         const tl = idx(x, y), tr = idx(x + 1, y), bl = idx(x, y + 1), br = idx(x + 1, y + 1);
         const hs = (hsGrid[tl] + hsGrid[tr] + hsGrid[bl] + hsGrid[br]) * 0.25;
-        [r, g, b] = shade(r, g, b, hs);
+        [r, g, b] = modulateWithShade(r, g, b, hs);
       }
 
-      colors.push(r, g, b, 255);
-      map[i] = nextV++;
+      colors.push(r, g, b, a);
+      map[iC] = nextV++;
     }
   }
 
-  // Triangulate the center lattice: for each 2x2 block of centers, 2 triangles
+  // Triangles on center lattice: 2 per 2x2 block of centers
   const indices = [];
+  const cidx2 = (x, y) => y * cw + x;
+
   for (let y = 0; y < ch - 1; y++) {
     for (let x = 0; x < cw - 1; x++) {
-      const v00 = map[cidx(x, y)];
-      const v10 = map[cidx(x + 1, y)];
-      const v01 = map[cidx(x, y + 1)];
-      const v11 = map[cidx(x + 1, y + 1)];
-
+      const v00 = map[cidx2(x, y)];
+      const v10 = map[cidx2(x + 1, y)];
+      const v01 = map[cidx2(x, y + 1)];
+      const v11 = map[cidx2(x + 1, y + 1)];
       if (v00 === -1 || v10 === -1 || v01 === -1 || v11 === -1) continue;
 
-      // Choose a consistent diagonal; you can pick based on slope if you want
+      // consistent diagonal
       indices.push(v00, v10, v11);
       indices.push(v00, v11, v01);
     }
@@ -246,38 +231,37 @@ self.onmessage = async (e) => {
     const {
       arrayBuffer,
       zExaggeration = 1.0,
-      colorInvert = false,
-      gamma = 1.0,
-      shadeStrength = 0.35,
+      // baked shading controls (set shadeStrength=0 to disable)
+      shadeStrength = 0.0,
       sunAzimuthDeg = 315,
       sunAltitudeDeg = 45,
+      // treat zero elevation as NODATA (matches many raster exports)
       treatZeroAsNoData = true,
     } = payload || {};
 
     const tiff = await GeoTIFF.fromArrayBuffer(arrayBuffer);
     const image = await tiff.getImage();
-    const rasters = await image.readRasters(); // [0]=elev
+    const rasters = await image.readRasters(); // Expect [0]=elev, [1]=R, [2]=G, [3]=B, ([4]=A optional)
     const width = image.getWidth();
     const height = image.getHeight();
     const bbox = image.getBoundingBox(); // [minX, minY, maxX, maxY]
     const [minLon, minLat, maxLon, maxLat] = bbox;
 
     const elev = rasters[0];
+    const R = rasters[1], G = rasters[2], B = rasters[3];
+    const A = rasters.length > 4 ? rasters[4] : null;
 
-    // color range (pre-exaggeration; scaled later)
-    const { minH, maxH } = computeElevRange(elev, treatZeroAsNoData);
-    const colorParams = { minH, maxH, colorInvert, gamma };
-
-    // optional hillshade (per source sample)
+    // optional hillshade per source sample
     const hsGrid = shadeStrength > 0
       ? computeGridHillshade(elev, width, height, minLon, maxLon, minLat, maxLat, zExaggeration, sunAzimuthDeg, sunAltitudeDeg)
       : null;
 
-    // build mesh on center lattice
+    // build mesh on center lattice using GeoTIFF colors
     const { positions, colors, indices } = buildCenterLatticeMesh({
       width, height, minLon, maxLon, minLat, maxLat,
-      elev, zExaggeration, treatZeroAsNoData,
-      colorParams, hsGrid, shadeStrength
+      elev, R, G, B, A,
+      zExaggeration, treatZeroAsNoData,
+      hsGrid, shadeStrength
     });
 
     const normals = computeNormals(positions, indices);
