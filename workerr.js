@@ -1,81 +1,38 @@
-/* meshWorker.js
+/* meshWorker.js */
+/* CPU-bound pipeline:
    - Parse GeoTIFF
-   - Build center-lattice mesh
-   - FLAT color per triangle (no interpolation): duplicate vertices per triangle, same RGBA
-   - Optional uniform hillshade modulation per triangle center (shadeStrength>0)
+   - Build positions/colors/indices (solid quads → two triangles)
    - Compute normals
-   - Returns typed arrays via Transferables
+   Returns typed arrays via Transferables
 */
+
 self.importScripts('https://cdn.jsdelivr.net/npm/geotiff');
 
 const NODATA_ELEV = -99999;
 
-// ---------- utils ----------
-const clamp01 = v => Math.max(0, Math.min(1, v));
-const clamp255 = v => Math.max(0, Math.min(255, v | 0));
-const degToRad = d => d * Math.PI / 180;
+// ----- WGS84 to ECEF (so we don’t need Cesium in worker) -----
+function degToRad(d) { return d * Math.PI / 180; }
 
-function hillshadeFromNormal(nx, ny, nz, Lx, Ly, Lz) {
-  return 0.25 + 0.75 * clamp01(nx * Lx + ny * Ly + nz * Lz);
-}
+// ----- Normals (per-vertex, accumulated from triangle faces) -----
+function computeNormals(positions /* Float64Array */, indices /* Uint32Array */) {
+  const n = positions.length / 3;
+  const normals = new Float32Array(positions.length); // 3 per vertex
+  // zero init by default
 
-// Simple central-diff hillshade at grid nodes
-function computeGridHillshade(elev, width, height, minLon, maxLon, minLat, maxLat, zExaggeration, sunAzimuthDeg, sunAltitudeDeg) {
-  const out = new Float32Array(width * height);
-
-  const latMid = (minLat + maxLat) * 0.5;
-  const mPerDegLat = 110540;
-  const mPerDegLon = 111320 * Math.cos(degToRad(latMid));
-  const dLon = (maxLon - minLon) / (width - 1 || 1);
-  const dLat = (maxLat - minLat) / (height - 1 || 1);
-  const dx = Math.abs(dLon) * mPerDegLon;
-  const dy = Math.abs(dLat) * mPerDegLat;
-
-  const az = degToRad(sunAzimuthDeg);   // 0=N, 90=E
-  const alt = degToRad(sunAltitudeDeg);
-  const Lx = Math.sin(az) * Math.cos(alt);
-  const Ly = Math.cos(az) * Math.cos(alt);
-  const Lz = Math.sin(alt);
-
-  const idx = (x, y) => y * width + x;
-
-  for (let y = 0; y < height; y++) {
-    const ym = Math.max(0, y - 1), yp = Math.min(height - 1, y + 1);
-    for (let x = 0; x < width; x++) {
-      const xm = Math.max(0, x - 1), xp = Math.min(width - 1, x + 1);
-      const c = elev[idx(x, y)];
-      if (c === NODATA_ELEV) { out[idx(x, y)] = 0.5; continue; }
-
-      const em = elev[idx(xp, y)] !== NODATA_ELEV ? elev[idx(xp, y)] : c;
-      const eM = elev[idx(xm, y)] !== NODATA_ELEV ? elev[idx(xm, y)] : c;
-      const en = elev[idx(x, yp)] !== NODATA_ELEV ? elev[idx(x, yp)] : c;
-      const eN = elev[idx(x, ym)] !== NODATA_ELEV ? elev[idx(x, ym)] : c;
-
-      const dzdx = ((em - eM) * 0.5 * zExaggeration) / (dx || 1);
-      const dzdy = ((en - eN) * 0.5 * zExaggeration) / (dy || 1);
-
-      let nx = -dzdx, ny = -dzdy, nz = 1;
-      const inv = 1 / Math.hypot(nx, ny, nz);
-      nx *= inv; ny *= inv; nz *= inv;
-
-      out[idx(x, y)] = hillshadeFromNormal(nx, ny, nz, Lx, Ly, Lz); // 0..1
-    }
-  }
-  return out;
-}
-
-function computeNormals(positions, indices) {
-  const normals = new Float32Array(positions.length); // zeros
   for (let i = 0; i < indices.length; i += 3) {
-    const ia = indices[i] * 3, ib = indices[i + 1] * 3, ic = indices[i + 2] * 3;
+    const ia = indices[i] * 3;
+    const ib = indices[i + 1] * 3;
+    const ic = indices[i + 2] * 3;
 
     const ax = positions[ia], ay = positions[ia + 1], az = positions[ia + 2];
     const bx = positions[ib], by = positions[ib + 1], bz = positions[ib + 2];
     const cx = positions[ic], cy = positions[ic + 1], cz = positions[ic + 2];
 
+    // edges
     const e1x = bx - ax, e1y = by - ay, e1z = bz - az;
     const e2x = cx - ax, e2y = cy - ay, e2z = cz - az;
 
+    // face normal = e1 x e2
     const nx = e1y * e2z - e1z * e2y;
     const ny = e1z * e2x - e1x * e2z;
     const nz = e1x * e2y - e1y * e2x;
@@ -84,237 +41,192 @@ function computeNormals(positions, indices) {
     normals[ib] += nx; normals[ib + 1] += ny; normals[ib + 2] += nz;
     normals[ic] += nx; normals[ic + 1] += ny; normals[ic + 2] += nz;
   }
-  // normalize (per-vertex; with no sharing, this equals per-face)
+
+  // normalize
   for (let i = 0; i < normals.length; i += 3) {
     const nx = normals[i], ny = normals[i + 1], nz = normals[i + 2];
     const len = Math.hypot(nx, ny, nz);
-    if (len > 0) { normals[i] = nx / len; normals[i + 1] = ny / len; normals[i + 2] = nz / len; }
+    if (len > 0) {
+      normals[i] = nx / len;
+      normals[i + 1] = ny / len;
+      normals[i + 2] = nz / len;
+    }
   }
   return normals;
 }
 
-// ---------- Center-lattice (no overlaps at tile seams) ----------
-function buildFlatTriangleMeshFromCenters_NoOverlap({
-  width, height,
-  minLon, maxLon, minLat, maxLat,
-  elev, R, G, B, A,
-  zExaggeration,
-  treatZeroAsNoData,
-  hsGrid, shadeStrength,
-  halfOpenEdges = true // skip last col/row of center-quads to avoid duplicates w/ neighbors
-}) {
-  const cw = width - 1, ch = height - 1; // centers = cw*ch
-  if (cw <= 1 || ch <= 1) {
-    return { positions: new Float64Array(0), colors: new Uint8Array(0), indices: new Uint32Array(0) };
-  }
-
-  const lonStep = (maxLon - minLon) / (width - 1 || 1);
-  const latStep = (maxLat - minLat) / (height - 1 || 1);
-  const idx  = (x, y) => y * width + x;
-  const cidx = (x, y) => y * cw + x;
-
-  // Precompute valid centers (need 4 corner samples)
-  const cH = new Float64Array(cw * ch);
-  const cRGBA = new Uint8Array(cw * ch * 4);
-  const cValid = new Uint8Array(cw * ch);
-
-  for (let y = 0; y < ch; y++) {
-    for (let x = 0; x < cw; x++) {
-      const tl = idx(x, y), tr = idx(x + 1, y), bl = idx(x, y + 1), br = idx(x + 1, y + 1);
-      const hTL = elev[tl], hTR = elev[tr], hBL = elev[bl], hBR = elev[br];
-
-      const valid =
-        hTL !== NODATA_ELEV && hTR !== NODATA_ELEV &&
-        hBL !== NODATA_ELEV && hBR !== NODATA_ELEV &&
-        !(treatZeroAsNoData && (hTL === 0 || hTR === 0 || hBL === 0 || hBR === 0));
-
-      const ci = cidx(x, y);
-      cValid[ci] = valid ? 1 : 0;
-
-      if (valid) {
-        cH[ci] = ((hTL + hTR + hBL + hBR) * 0.25) * zExaggeration;
-
-        const r = ((R[tl] + R[tr] + R[bl] + R[br]) * 0.25) | 0;
-        const g = ((G[tl] + G[tr] + G[bl] + G[br]) * 0.25) | 0;
-        const b = ((B[tl] + B[tr] + B[bl] + B[br]) * 0.25) | 0;
-        const a = A ? ((A[tl] + A[tr] + A[bl] + A[br]) * 0.25) | 0 : 255;
-
-        const o = ci * 4;
-        cRGBA[o] = r; cRGBA[o + 1] = g; cRGBA[o + 2] = b; cRGBA[o + 3] = a;
-      }
+// Build “solid rectangles” (grid cell → 2 triangles) with single color per cell (from top-left)
+function buildSolidRectGrid(grid, positionsAll, colorsAll, indexMap, width, height) {
+  // Count quads
+  let quadCount = 0;
+  for (let y = 0; y < height - 1; y++) {
+    for (let x = 0; x < width - 1; x++) {
+      const tl = y * width + x;
+      const tr = tl + 1;
+      const bl = (y + 1) * width + x;
+      const br = bl + 1;
+      if (
+        indexMap[tl] !== -1 &&
+        indexMap[tr] !== -1 &&
+        indexMap[bl] !== -1 &&
+        indexMap[br] !== -1
+      ) quadCount++;
     }
   }
 
-  // helpers for center pos/color
-  function centerPos(x, y) {
-    const latC = ((maxLat - y * latStep) + (maxLat - (y + 1) * latStep)) * 0.5;
-    const lonC = ((minLon + x * lonStep) + (minLon + (x + 1) * lonStep)) * 0.5;
-    const h = cH[cidx(x, y)];
-    return [latC, lonC, h];
-  }
-  function centerRGBA(x, y) {
-    const o = cidx(x, y) * 4;
-    return [cRGBA[o], cRGBA[o + 1], cRGBA[o + 2], cRGBA[o + 3]];
-  }
+  const outPositions = new Float64Array(quadCount * 4 * 3); // 4 verts * 3
+  const outColors = new Uint8Array(quadCount * 4 * 4);   // 4 verts * RGBA
+  const outIndices = new Uint32Array(quadCount * 6);      // 2 tris * 3
 
-  // optional uniform shading modulation per-triangle (use centroid in center-grid)
-  function modulateRGB(r, g, b, cx, cy) {
-    if (!shadeStrength || !hsGrid) return [r, g, b];
-    const s = Math.max(0, Math.min(1, shadeStrength));
+  let vtx = 0;  // vertex cursor (4 per quad)
+  let idx = 0;  // index cursor (6 per quad)
 
-    // map centroid to nearest raster 2×2 block
-    const gx = Math.max(0, Math.min(width  - 2, Math.floor(cx)));
-    const gy = Math.max(0, Math.min(height - 2, Math.floor(cy)));
-    const tl = idx(gx, gy), tr = idx(gx + 1, gy), bl = idx(gx, gy + 1), br = idx(gx + 1, gy + 1);
-    const hs = (hsGrid[tl] + hsGrid[tr] + hsGrid[bl] + hsGrid[br]) * 0.25; // 0..1
-    const lit = (hs * 255) | 0;
-    return [clamp255((1 - s) * r + s * lit), clamp255((1 - s) * g + s * lit), clamp255((1 - s) * b + s * lit)];
-  }
+  for (let y = 0; y < height - 1; y++) {
+    for (let x = 0; x < width - 1; x++) {
+      const tl = y * width + x;
+      const tr = tl + 1;
+      const bl = (y + 1) * width + x;
+      const br = bl + 1;
 
-  // Decide iteration bounds for 2×2 blocks of centers
-  const maxX = halfOpenEdges ? (cw - 1) : (cw - 0);
-  const maxY = halfOpenEdges ? (ch - 1) : (ch - 0);
+      const i0 = indexMap[tl];
+      const i1 = indexMap[bl];
+      const i2 = indexMap[br];
+      const i3 = indexMap[tr];
 
-  // Count triangles (2 per valid 2×2 block of centers)
-  let triCount = 0;
-  for (let y = 0; y < maxY - 1; y++) {
-    for (let x = 0; x < maxX - 1; x++) {
-      if (cValid[cidx(x, y)] && cValid[cidx(x + 1, y)] && cValid[cidx(x, y + 1)] && cValid[cidx(x + 1, y + 1)]) {
-        triCount += 2;
-      }
+      if (i0 === -1 || i1 === -1 || i2 === -1 || i3 === -1) continue;
+
+      // Color from top-left
+      const cBase = i0 * 4;
+      const r = colorsAll[cBase], g = colorsAll[cBase + 1], b = colorsAll[cBase + 2], a = colorsAll[cBase + 3];
+
+      const addCopy = (srcIndex) => {
+        const pBase = srcIndex * 3;
+        const o = vtx * 3;
+        outPositions[o] = positionsAll[pBase];
+        outPositions[o + 1] = positionsAll[pBase + 1];
+        outPositions[o + 2] = positionsAll[pBase + 2];
+
+        const co = vtx * 4;
+        outColors[co] = r;
+        outColors[co + 1] = g;
+        outColors[co + 2] = b;
+        outColors[co + 3] = a;
+        vtx++;
+      };
+
+      addCopy(i0);
+      addCopy(i1);
+      addCopy(i2);
+      addCopy(i3);
+
+      // two triangles: (0,1,2) and (0,2,3) within the 4 new vertices of this quad
+      const base = vtx - 4;
+      outIndices[idx++] = base;
+      outIndices[idx++] = base + 1;
+      outIndices[idx++] = base + 2;
+      outIndices[idx++] = base;
+      outIndices[idx++] = base + 2;
+      outIndices[idx++] = base + 3;
     }
   }
 
-  const positions = new Float64Array(triCount * 3 * 3);
-  const colors    = new Uint8Array (triCount * 3 * 4);
-  const indices   = new Uint32Array(triCount * 3);
-
-  let vPtr = 0, cPtr = 0, iPtr = 0, vStart = 0;
-
-  // Build triangles across 2×2 center blocks (consistent diagonal)
-  for (let y = 0; y < maxY - 1; y++) {
-    for (let x = 0; x < maxX - 1; x++) {
-      const v00 = cValid[cidx(x, y)];
-      const v10 = cValid[cidx(x + 1, y)];
-      const v01 = cValid[cidx(x, y + 1)];
-      const v11 = cValid[cidx(x + 1, y + 1)];
-      if (!(v00 && v10 && v01 && v11)) continue;
-
-      const p00 = centerPos(x, y);
-      const p10 = centerPos(x + 1, y);
-      const p01 = centerPos(x, y + 1);
-      const p11 = centerPos(x + 1, y + 1);
-
-      let c00 = centerRGBA(x, y);
-      let c10 = centerRGBA(x + 1, y);
-      let c01 = centerRGBA(x, y + 1);
-      let c11 = centerRGBA(x + 1, y + 1);
-
-      // Triangle 1: (00, 10, 11)
-      {
-        let r = ((c00[0] + c10[0] + c11[0]) / 3) | 0;
-        let g = ((c00[1] + c10[1] + c11[1]) / 3) | 0;
-        let b = ((c00[2] + c10[2] + c11[2]) / 3) | 0;
-        let a = ((c00[3] + c10[3] + c11[3]) / 3) | 0;
-
-        // centroid in center-grid coords
-        [r, g, b] = modulateRGB(r, g, b, x + (2/3), y + (1/3)); // rough centroid of (00,10,11)
-
-        positions[vPtr++] = p00[0]; positions[vPtr++] = p00[1]; positions[vPtr++] = p00[2];
-        positions[vPtr++] = p10[0]; positions[vPtr++] = p10[1]; positions[vPtr++] = p10[2];
-        positions[vPtr++] = p11[0]; positions[vPtr++] = p11[1]; positions[vPtr++] = p11[2];
-
-        colors[cPtr++] = r; colors[cPtr++] = g; colors[cPtr++] = b; colors[cPtr++] = a;
-        colors[cPtr++] = r; colors[cPtr++] = g; colors[cPtr++] = b; colors[cPtr++] = a;
-        colors[cPtr++] = r; colors[cPtr++] = g; colors[cPtr++] = b; colors[cPtr++] = a;
-
-        indices[iPtr++] = vStart++;
-        indices[iPtr++] = vStart++;
-        indices[iPtr++] = vStart++;
-      }
-
-      // Triangle 2: (00, 11, 01)
-      {
-        let r = ((c00[0] + c11[0] + c01[0]) / 3) | 0;
-        let g = ((c00[1] + c11[1] + c01[1]) / 3) | 0;
-        let b = ((c00[2] + c11[2] + c01[2]) / 3) | 0;
-        let a = ((c00[3] + c11[3] + c01[3]) / 3) | 0;
-
-        [r, g, b] = modulateRGB(r, g, b, x + (1/3), y + (2/3)); // rough centroid of (00,11,01)
-
-        positions[vPtr++] = p00[0]; positions[vPtr++] = p00[1]; positions[vPtr++] = p00[2];
-        positions[vPtr++] = p11[0]; positions[vPtr++] = p11[1]; positions[vPtr++] = p11[2];
-        positions[vPtr++] = p01[0]; positions[vPtr++] = p01[1]; positions[vPtr++] = p01[2];
-
-        colors[cPtr++] = r; colors[cPtr++] = g; colors[cPtr++] = b; colors[cPtr++] = a;
-        colors[cPtr++] = r; colors[cPtr++] = g; colors[cPtr++] = b; colors[cPtr++] = a;
-        colors[cPtr++] = r; colors[cPtr++] = g; colors[cPtr++] = b; colors[cPtr++] = a;
-
-        indices[iPtr++] = vStart++;
-        indices[iPtr++] = vStart++;
-        indices[iPtr++] = vStart++;
-      }
-    }
-  }
-
-  return { positions, colors, indices };
+  return { outPositions, outColors, outIndices };
 }
-// ----------------- Worker entry -----------------
+
+function webMercatorToLonLat(x, y) {
+  const R = 6378137.0;
+  const lon = (x / R) * (180 / Math.PI);
+  const lat = (2 * Math.atan(Math.exp(y / R)) - Math.PI / 2) * (180 / Math.PI);
+  return [lon, lat];
+}
+
 self.onmessage = async (e) => {
   const { id, type, payload } = e.data || {};
   try {
-    if (type !== 'PROCESS_TIFF') throw new Error(`Unknown worker message type: ${type}`);
+    if (type === 'PROCESS_TIFF') {
+      const { arrayBuffer, deltaZ = 0 } = payload;
 
-    const {
-      arrayBuffer,
-      zExaggeration = 1.0,
-      // Flat color: set >0 only if you want *uniform* light/dark modulation per triangle
-      shadeStrength = 0.0,
-      sunAzimuthDeg = 315,
-      sunAltitudeDeg = 45,
-      treatZeroAsNoData = true,
-    } = payload || {};
+      const tiff = await GeoTIFF.fromArrayBuffer(arrayBuffer);
+      const image = await tiff.getImage();
+      const rasters = await image.readRasters(); // [0]=elev, [1]=R, [2]=G, [3]=B (as in your pipeline)
+      const width = image.getWidth();
+      const height = image.getHeight();
 
-    const tiff = await GeoTIFF.fromArrayBuffer(arrayBuffer);
-    const image = await tiff.getImage();
-    const rasters = await image.readRasters(); // [0]=elev, [1]=R, [2]=G, [3]=B, ([4]=A optional)
-    const width  = image.getWidth();
-    const height = image.getHeight();
-    const bbox   = image.getBoundingBox(); // [minX, minY, maxX, maxY]
-    const [minLon, minLat, maxLon, maxLat] = bbox;
+      const bbox = image.getBoundingBox(); // [minX, minY, maxX, maxY]
+      const minX = bbox[0], minY = bbox[1], maxX = bbox[2], maxY = bbox[3];
+      const lonStep = (maxX - minX) / (width - 1 || 1);
+      const latStep = (maxY - minY) / (height - 1 || 1);
 
-    const elev = rasters[0];
-    const R = rasters[1], G = rasters[2], B = rasters[3];
-    const A = rasters.length > 4 ? rasters[4] : null;
+      const elev = rasters[0];
+      const R = rasters[1], G = rasters[2], B = rasters[3];
 
-    const hsGrid = shadeStrength > 0
-      ? computeGridHillshade(elev, width, height, minLon, maxLon, minLat, maxLat, zExaggeration, sunAzimuthDeg, sunAltitudeDeg)
-      : null;
+      // Build sparse vertex map (skip nodata / zero elev)
+      const positions = [];
+      const colors = [];
+      const indexMap = new Int32Array(width * height);
+      indexMap.fill(-1);
 
-    const { positions, colors, indices } = buildFlatTriangleMeshFromCenters({
-      width, height, minLon, maxLon, minLat, maxLat,
-      elev, R, G, B, A,
-      zExaggeration,
-      treatZeroAsNoData,
-      hsGrid, shadeStrength
-    });
+      let nextIdx = 0;
 
-    const normals = computeNormals(positions, indices);
+      for (let y = 0; y < height; y++) {
+        const lat = maxY - y * latStep;
+        for (let x = 0; x < width; x++) {
+          const lon = minX + x * lonStep;
+          const i = y * width + x;
 
+          let h = (elev[i] === NODATA_ELEV) ? 0 : Number(elev[i]);
+          let r = Number(R[i]), g = Number(G[i]), b = Number(B[i]);
+          let a = 255;
+
+          if (h === 0) {
+            // transparent white for no-elev
+            h = 0;
+            a = 100;
+            r = 255; g = 255; b = 255;
+          } else {
+            h += Number(deltaZ || 0);
+          }
+
+          if (h > 0) {
+            positions.push(lat, lon, h);
+            colors.push(r, g, b, a);
+            indexMap[i] = nextIdx++;
+          }
+        }
+      }
+
+      const posArr = new Float64Array(positions);
+      const colArr = new Uint8Array(colors);
+
+      // Solid rectangles (quads)
+      const { outPositions, outColors, outIndices } =
+        buildSolidRectGrid({ width, height }, posArr, colArr, indexMap, width, height);
+
+      const normals = computeNormals(outPositions, outIndices);
+
+      // Prepare result (use transferables to avoid copying)
+      self.postMessage({
+        id,
+        ok: true,
+        result: {
+          width,
+          height,
+          bbox, // [minX, minY, maxX, maxY] (degrees if source is EPSG:4326)
+          positions: outPositions.buffer,
+          colors: outColors.buffer,
+          indices: outIndices.buffer,
+          normals: normals.buffer
+        }
+      }, [outPositions.buffer, outColors.buffer, outIndices.buffer, normals.buffer]);
+
+    } else {
+      throw new Error(`Unknown worker message type: ${type}`);
+    }
+  } catch (err) {
     self.postMessage({
       id,
-      ok: true,
-      result: {
-        width, height, bbox,
-        positions: positions.buffer,
-        colors: colors.buffer,
-        indices: indices.buffer,
-        normals: normals.buffer
-      }
-    }, [positions.buffer, colors.buffer, indices.buffer, normals.buffer]);
-
-  } catch (err) {
-    self.postMessage({ id, ok: false, error: (err && err.message) || String(err) });
+      ok: false,
+      error: (err && err.message) || String(err)
+    });
   }
 };
-
