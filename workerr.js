@@ -1,9 +1,11 @@
 /* meshWorker.js
    - Parse GeoTIFF
-   - Build positions/colors/indices (solid quads → two triangles)
-   - Color by elevation (red→blue), optional hillshade baked
+   - Build a mesh on the GRID-CENTER lattice:
+       centers = (width-1) x (height-1)
+       triangles connect adjacent centers (2 per quad)
+   - Vertex color by elevation (red→blue), optional hillshade baked
    - Compute normals
-   Returns typed arrays via Transferables
+   - Returns typed arrays via Transferables
 */
 self.importScripts('https://cdn.jsdelivr.net/npm/geotiff');
 
@@ -14,22 +16,17 @@ const clamp01 = v => Math.max(0, Math.min(1, v));
 const clamp255 = v => Math.max(0, Math.min(255, v | 0));
 const degToRad = d => d * Math.PI / 180;
 
-// Linear red→blue (low→high), with optional gamma + invert
+// red→blue ramp with optional gamma + invert
 function elevToColor(h, minH, maxH, { colorInvert = false, gamma = 1.0 } = {}) {
-  if (!isFinite(h) || maxH <= minH) return [200, 200, 200]; // fallback gray
-  let t = (h - minH) / (maxH - minH);      // 0..1
+  if (!isFinite(h) || maxH <= minH) return [200, 200, 200];
+  let t = (h - minH) / (maxH - minH);
   t = clamp01(t);
   if (gamma && gamma !== 1) t = Math.pow(t, gamma);
   if (colorInvert) t = 1 - t;
-
-  // Red→Blue
-  const r = 255 * (1 - t);
-  const g = 0;
-  const b = 255 * t;
+  const r = 255 * (1 - t), g = 0, b = 255 * t;
   return [r | 0, g, b | 0];
 }
 
-// Optional hillshade (to enhance depth cues even with same hues)
 function hillshadeFromNormal(nx, ny, nz, Lx, Ly, Lz) {
   return 0.25 + 0.75 * clamp01(nx * Lx + ny * Ly + nz * Lz);
 }
@@ -58,8 +55,7 @@ function computeNormals(positions, indices) {
   return normals;
 }
 
-// Compute min/max of valid elevations (ignores nodata and zeros if you treat zero as “no elev”)
-function computeElevRange(elev, treatZeroAsNoData = true) {
+function computeElevRange(elev, treatZeroAsNoData) {
   let minH = +Infinity, maxH = -Infinity, any = false;
   for (let i = 0; i < elev.length; i++) {
     const h = elev[i];
@@ -71,14 +67,13 @@ function computeElevRange(elev, treatZeroAsNoData = true) {
     any = true;
   }
   if (!any) { minH = 0; maxH = 1; }
-  if (maxH === minH) maxH = minH + 1e-6; // avoid div/0
+  if (maxH === minH) maxH = minH + 1e-6;
   return { minH, maxH };
 }
 
-// Simple per-grid hillshade from gradients (optional)
+// Per-grid hillshade (used only to modulate vertex color if shadeStrength>0)
 function computeGridHillshade(elev, width, height, minLon, maxLon, minLat, maxLat, zExaggeration, sunAzimuthDeg, sunAltitudeDeg) {
   const out = new Float32Array(width * height);
-
   const latMid = (minLat + maxLat) * 0.5;
   const mPerDegLat = 110540;
   const mPerDegLon = 111320 * Math.cos(degToRad(latMid));
@@ -87,7 +82,7 @@ function computeGridHillshade(elev, width, height, minLon, maxLon, minLat, maxLa
   const dx = Math.abs(dLon) * mPerDegLon;
   const dy = Math.abs(dLat) * mPerDegLat;
 
-  const az = degToRad(sunAzimuthDeg);   // 0=N,90=E
+  const az = degToRad(sunAzimuthDeg);   // 0=N, 90=E
   const alt = degToRad(sunAltitudeDeg);
   const Lx = Math.sin(az) * Math.cos(alt);
   const Ly = Math.cos(az) * Math.cos(alt);
@@ -115,26 +110,68 @@ function computeGridHillshade(elev, width, height, minLon, maxLon, minLat, maxLa
   return out;
 }
 
-// Build solid-quad mesh; pick color for each cell from TL vertex elevation
-function buildSolidRectGrid(positionsAll, indexMap, width, height, elevGrid, colorParams, hillshadeGrid, shadeStrength) {
-  // Count quads with all four vertices present
-  let quadCount = 0;
-  for (let y = 0; y < height - 1; y++) {
-    for (let x = 0; x < width - 1; x++) {
-      const tl = y * width + x;
-      const tr = tl + 1;
-      const bl = (y + 1) * width + x;
-      const br = bl + 1;
-      if (indexMap[tl] !== -1 && indexMap[tr] !== -1 && indexMap[bl] !== -1 && indexMap[br] !== -1) quadCount++;
+// ------------- Build mesh on center lattice -------------
+function buildCenterLatticeMesh({
+  width, height,
+  minLon, maxLon, minLat, maxLat,
+  elev, zExaggeration,
+  treatZeroAsNoData,
+  colorParams, hsGrid, shadeStrength
+}) {
+  // centers grid size
+  const cw = width - 1;
+  const ch = height - 1;
+  if (cw <= 0 || ch <= 0) {
+    return {
+      positions: new Float64Array(0),
+      colors: new Uint8Array(0),
+      indices: new Uint32Array(0)
+    };
+  }
+
+  const lonStep = (maxLon - minLon) / (width - 1 || 1);
+  const latStep = (maxLat - minLat) / (height - 1 || 1);
+  const centerLonStep = lonStep; // center at mid of cell => same spacing
+  const centerLatStep = latStep;
+
+  const idx = (x, y) => y * width + x;
+  const cidx = (x, y) => y * cw + x;
+
+  // Prepare center elevation & validity
+  const centerH = new Float64Array(cw * ch);
+  const centerValid = new Uint8Array(cw * ch);
+
+  for (let y = 0; y < ch; y++) {
+    for (let x = 0; x < cw; x++) {
+      const tl = idx(x, y);
+      const tr = idx(x + 1, y);
+      const bl = idx(x, y + 1);
+      const br = idx(x + 1, y + 1);
+
+      const hTL = elev[tl], hTR = elev[tr], hBL = elev[bl], hBR = elev[br];
+
+      // A center is valid only if all 4 surrounding samples are valid
+      const valid =
+        hTL !== NODATA_ELEV && hTR !== NODATA_ELEV &&
+        hBL !== NODATA_ELEV && hBR !== NODATA_ELEV &&
+        !(treatZeroAsNoData && (hTL === 0 || hTR === 0 || hBL === 0 || hBR === 0));
+
+      if (valid) {
+        const h = (hTL + hTR + hBL + hBR) * 0.25;
+        centerH[cidx(x, y)] = h * zExaggeration;
+        centerValid[cidx(x, y)] = 1;
+      } else {
+        centerH[cidx(x, y)] = 0;
+        centerValid[cidx(x, y)] = 0;
+      }
     }
   }
 
-  const outPositions = new Float64Array(quadCount * 4 * 3);
-  const outColors    = new Uint8Array(quadCount * 4 * 4);
-  const outIndices   = new Uint32Array(quadCount * 6);
-
-  let vtx = 0;
-  let idx = 0;
+  // Build vertex arrays (one vertex per valid center)
+  const positions = [];
+  const colors = [];
+  const map = new Int32Array(cw * ch);
+  map.fill(-1);
 
   const shade = (r, g, b, hs) => {
     if (!shadeStrength) return [r, g, b];
@@ -146,51 +183,61 @@ function buildSolidRectGrid(positionsAll, indexMap, width, height, elevGrid, col
     return [nr, ng, nb];
   };
 
-  for (let y = 0; y < height - 1; y++) {
-    for (let x = 0; x < width - 1; x++) {
-      const tl = y * width + x;
-      const tr = tl + 1;
-      const bl = (y + 1) * width + x;
-      const br = bl + 1;
+  let nextV = 0;
+  for (let y = 0; y < ch; y++) {
+    // center latitude = average of two row lats
+    const latC = ( (maxLat - y * latStep) + (maxLat - (y + 1) * latStep) ) * 0.5;
+    for (let x = 0; x < cw; x++) {
+      // center longitude = average of two column lons
+      const lonC = ( (minLon + x * lonStep) + (minLon + (x + 1) * lonStep) ) * 0.5;
 
-      const i0 = indexMap[tl], i1 = indexMap[bl], i2 = indexMap[br], i3 = indexMap[tr];
-      if (i0 === -1 || i1 === -1 || i2 === -1 || i3 === -1) continue;
+      const i = cidx(x, y);
+      if (!centerValid[i]) { map[i] = -1; continue; }
 
-      // Base color from elevation at TL
-      const hTL = elevGrid[tl];
-      let [r, g, b] = elevToColor(hTL, colorParams.minH, colorParams.maxH, colorParams);
+      const h = centerH[i];
+      positions.push(latC, lonC, h);
 
-      // Optional hillshade baked
-      if (hillshadeGrid) {
-        const hs = hillshadeGrid[tl];
+      // Color by center elevation; note we pass the *pre-exaggeration* range scaled by zExaggeration to be consistent.
+      // You can also feed already-scaled min/max from outside if preferred.
+      let [r, g, b] = elevToColor(h, colorParams.minH * zExaggeration, colorParams.maxH * zExaggeration, colorParams);
+
+      // Approx hillshade at center = average of the 4 surrounding sample hillshades (if available)
+      if (hsGrid) {
+        const tl = idx(x, y), tr = idx(x + 1, y), bl = idx(x, y + 1), br = idx(x + 1, y + 1);
+        const hs = (hsGrid[tl] + hsGrid[tr] + hsGrid[bl] + hsGrid[br]) * 0.25;
         [r, g, b] = shade(r, g, b, hs);
       }
 
-      const addCopy = (srcIndex) => {
-        const pBase = srcIndex * 3, o = vtx * 3;
-        outPositions[o]     = positionsAll[pBase];
-        outPositions[o + 1] = positionsAll[pBase + 1];
-        outPositions[o + 2] = positionsAll[pBase + 2];
-
-        const co = vtx * 4;
-        outColors[co]     = r;
-        outColors[co + 1] = g;
-        outColors[co + 2] = b;
-        outColors[co + 3] = 255;
-        vtx++;
-      };
-
-      addCopy(i0); addCopy(i1); addCopy(i2); addCopy(i3);
-
-      const base = vtx - 4;
-      outIndices[idx++] = base;     outIndices[idx++] = base + 1; outIndices[idx++] = base + 2;
-      outIndices[idx++] = base;     outIndices[idx++] = base + 2; outIndices[idx++] = base + 3;
+      colors.push(r, g, b, 255);
+      map[i] = nextV++;
     }
   }
 
-  return { outPositions, outColors, outIndices };
+  // Triangulate the center lattice: for each 2x2 block of centers, 2 triangles
+  const indices = [];
+  for (let y = 0; y < ch - 1; y++) {
+    for (let x = 0; x < cw - 1; x++) {
+      const v00 = map[cidx(x, y)];
+      const v10 = map[cidx(x + 1, y)];
+      const v01 = map[cidx(x, y + 1)];
+      const v11 = map[cidx(x + 1, y + 1)];
+
+      if (v00 === -1 || v10 === -1 || v01 === -1 || v11 === -1) continue;
+
+      // Choose a consistent diagonal; you can pick based on slope if you want
+      indices.push(v00, v10, v11);
+      indices.push(v00, v11, v01);
+    }
+  }
+
+  return {
+    positions: new Float64Array(positions),
+    colors: new Uint8Array(colors),
+    indices: new Uint32Array(indices),
+  };
 }
 
+// ----------------- Worker entry -----------------
 self.onmessage = async (e) => {
   const { id, type, payload } = e.data || {};
   try {
@@ -198,86 +245,54 @@ self.onmessage = async (e) => {
 
     const {
       arrayBuffer,
-      deltaZ = 0,
-      zExaggeration = 1.0,     // makes small relief visible
-      // elevation color ramp controls
+      zExaggeration = 1.0,
       colorInvert = false,
       gamma = 1.0,
-      // hillshade (set to 0 to disable baking)
-      shadeStrength = 0.5,
+      shadeStrength = 0.35,
       sunAzimuthDeg = 315,
       sunAltitudeDeg = 45,
-      // treat zero as "no elevation" like before
       treatZeroAsNoData = true,
     } = payload || {};
 
     const tiff = await GeoTIFF.fromArrayBuffer(arrayBuffer);
     const image = await tiff.getImage();
-    const rasters = await image.readRasters(); // [0]=elev, others ignored
+    const rasters = await image.readRasters(); // [0]=elev
     const width = image.getWidth();
     const height = image.getHeight();
-
     const bbox = image.getBoundingBox(); // [minX, minY, maxX, maxY]
     const [minLon, minLat, maxLon, maxLat] = bbox;
-    const lonStep = (maxLon - minLon) / (width - 1 || 1);
-    const latStep = (maxLat - minLat) / (height - 1 || 1);
 
     const elev = rasters[0];
 
-    // Elevation range for coloring
+    // color range (pre-exaggeration; scaled later)
     const { minH, maxH } = computeElevRange(elev, treatZeroAsNoData);
     const colorParams = { minH, maxH, colorInvert, gamma };
 
-    // Optional hillshade grid (in source grid space)
+    // optional hillshade (per source sample)
     const hsGrid = shadeStrength > 0
       ? computeGridHillshade(elev, width, height, minLon, maxLon, minLat, maxLat, zExaggeration, sunAzimuthDeg, sunAltitudeDeg)
       : null;
 
-    // Build vertices (skip nodata / zero if configured)
-    const positions = [];
-    const indexMap = new Int32Array(width * height);
-    indexMap.fill(-1);
+    // build mesh on center lattice
+    const { positions, colors, indices } = buildCenterLatticeMesh({
+      width, height, minLon, maxLon, minLat, maxLat,
+      elev, zExaggeration, treatZeroAsNoData,
+      colorParams, hsGrid, shadeStrength
+    });
 
-    let nextIdx = 0;
-    for (let y = 0; y < height; y++) {
-      const lat = maxLat - y * latStep;
-      for (let x = 0; x < width; x++) {
-        const lon = minLon + x * lonStep;
-        const i = y * width + x;
-
-        let h = elev[i];
-        if (h === NODATA_ELEV || (!h && treatZeroAsNoData)) {
-          indexMap[i] = -1;
-          continue;
-        }
-        h = (h + Number(deltaZ || 0)) * Number(zExaggeration || 1);
-
-        positions.push(lat, lon, h);
-        indexMap[i] = nextIdx++;
-      }
-    }
-
-    const posArr = new Float64Array(positions);
-
-    // Build quads with elevation-based coloring
-    const { outPositions, outColors, outIndices } =
-      buildSolidRectGrid(posArr, indexMap, width, height, elev, colorParams, hsGrid, shadeStrength);
-
-    const normals = computeNormals(outPositions, outIndices);
+    const normals = computeNormals(positions, indices);
 
     self.postMessage({
       id,
       ok: true,
       result: {
-        width,
-        height,
-        bbox,
-        positions: outPositions.buffer,
-        colors: outColors.buffer,
-        indices: outIndices.buffer,
+        width, height, bbox,
+        positions: positions.buffer,
+        colors: colors.buffer,
+        indices: indices.buffer,
         normals: normals.buffer
       }
-    }, [outPositions.buffer, outColors.buffer, outIndices.buffer, normals.buffer]);
+    }, [positions.buffer, colors.buffer, indices.buffer, normals.buffer]);
 
   } catch (err) {
     self.postMessage({ id, ok: false, error: (err && err.message) || String(err) });
