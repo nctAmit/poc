@@ -1,24 +1,21 @@
 /* meshWorker.js */
-/* CPU-bound pipeline:
+/* Pipeline:
    - Parse GeoTIFF
-   - Build shared grid (one vertex per raster sample)
-   - Compute smooth normals on shared grid
-   - Emit center-fan per cell (4 tris) with flat per-cell color (from TL) and shared normals
-   Returns typed arrays via Transferables
+   - Build center-fan triangles per cell: (C, TL, BL), (C, BL, BR), (C, BR, TR), (C, TR, TL)
+   - Per-triangle FLAT color (same for all 3 vertices)
+   - Per-triangle FLAT normal (same for all 3 vertices), computed in local ENU (meters)
+   - Transfer typed arrays
 */
 
 self.importScripts('https://cdn.jsdelivr.net/npm/geotiff');
 
 const NODATA_ELEV = -99999;
 
-// ---------------- utils ----------------
-function degToRad(d) { return d * Math.PI / 180; }
-
-// Simple heuristic: if bbox numbers are way beyond degrees, assume Web Mercator (EPSG:3857)
+// ---------- CRS helpers ----------
 function bboxIsWebMercator(bbox) {
   const [minX, minY, maxX, maxY] = bbox;
   const maxAbs = Math.max(Math.abs(minX), Math.abs(minY), Math.abs(maxX), Math.abs(maxY));
-  return maxAbs > 360; // > degrees range → likely meters
+  return maxAbs > 360; // numbers >> degrees → meters (EPSG:3857)
 }
 
 function webMercatorToLonLat(x, y) {
@@ -28,179 +25,161 @@ function webMercatorToLonLat(x, y) {
   return [lon, lat];
 }
 
-// Per-vertex normals accumulated from triangle faces (positions in any consistent space)
-function computeNormals(positions /* Float64Array */, indices /* Uint32Array */) {
-  const normals = new Float32Array(positions.length); // zeroed
-  for (let i = 0; i < indices.length; i += 3) {
-    const ia = indices[i] * 3, ib = indices[i + 1] * 3, ic = indices[i + 2] * 3;
-
-    const ax = positions[ia],     ay = positions[ia + 1],     az = positions[ia + 2];
-    const bx = positions[ib],     by = positions[ib + 1],     bz = positions[ib + 2];
-    const cx = positions[ic],     cy = positions[ic + 1],     cz = positions[ic + 2];
-
-    const e1x = bx - ax, e1y = by - ay, e1z = bz - az;
-    const e2x = cx - ax, e2y = cy - ay, e2z = cz - az;
-
-    const nx = e1y * e2z - e1z * e2y;
-    const ny = e1z * e2x - e1x * e2z;
-    const nz = e1x * e2y - e1y * e2x;
-
-    normals[ia]     += nx; normals[ia + 1] += ny; normals[ia + 2] += nz;
-    normals[ib]     += nx; normals[ib + 1] += ny; normals[ib + 2] += nz;
-    normals[ic]     += nx; normals[ic + 1] += ny; normals[ic + 2] += nz;
-  }
-  // normalize
-  for (let i = 0; i < normals.length; i += 3) {
-    const nx = normals[i], ny = normals[i + 1], nz = normals[i + 2];
-    const len = Math.hypot(nx, ny, nz);
-    if (len > 0) {
-      normals[i]     = nx / len;
-      normals[i + 1] = ny / len;
-      normals[i + 2] = nz / len;
-    }
-  }
-  return normals;
+// ---------- ENU (meters) relative to tile center ----------
+function makeLonLatToENU(lon0, lat0) {
+  const R = 6378137.0;
+  const lat0rad = lat0 * Math.PI / 180;
+  const cosLat0 = Math.cos(lat0rad);
+  return function lonLatH_to_ENU(lon, lat, h) {
+    const xEast  = (lon - lon0) * (Math.PI / 180) * R * cosLat0;
+    const yNorth = (lat - lat0) * (Math.PI / 180) * R;
+    const zUp    = h;
+    return [xEast, yNorth, zUp];
+  };
 }
 
-function buildSharedGridIndices(indexMap, width, height) {
-  const arr = [];
+// ---------- vector helpers ----------
+function sub(a, b) { return [a[0]-b[0], a[1]-b[1], a[2]-b[2]]; }
+function cross(a, b) { return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]; }
+function normalize(v) {
+  const L = Math.hypot(v[0], v[1], v[2]);
+  return L > 0 ? [v[0]/L, v[1]/L, v[2]/L] : [0,0,1];
+}
+
+// ---------- core builder: center-connected triangles with flat colors & face normals ----------
+function buildCenterFanFlatTri(positionsGrid /* Float64Array [lat,lon,h]* */,
+                               colorsGrid    /* Uint8Array [r,g,b,a]* */,
+                               indexMap      /* Int32Array */,
+                               width, height,
+                               lon0, lat0) {
+
+  // Pre-bind ENU converter
+  const toENU = makeLonLatToENU(lon0, lat0);
+
+  // Count valid quads (all 4 corners exist)
+  let quadCount = 0;
   for (let y = 0; y < height - 1; y++) {
     for (let x = 0; x < width - 1; x++) {
       const tl = y * width + x;
       const tr = tl + 1;
       const bl = (y + 1) * width + x;
       const br = bl + 1;
-      const iTL = indexMap[tl], iTR = indexMap[tr], iBL = indexMap[bl], iBR = indexMap[br];
-      if (iTL === -1 || iTR === -1 || iBL === -1 || iBR === -1) continue;
-      // shared-vertex grid for normal calc (two tris per cell)
-      arr.push(iTL, iTR, iBR,  iTL, iBR, iBL);
-    }
-  }
-  return new Uint32Array(arr);
-}
-
-function normalize3(x, y, z) {
-  const L = Math.hypot(x, y, z);
-  return L > 0 ? [x / L, y / L, z / L] : [0, 0, 1];
-}
-
-// Build center-fan per cell with flat color while copying smooth normals from shared grid
-function buildCenterFanWithSmoothNormals(positionsAll, colorsAll, sharedNormals, indexMap, width, height) {
-  // Count valid quads
-  let quadCount = 0;
-  for (let y = 0; y < height - 1; y++) {
-    for (let x = 0; x < width - 1; x++) {
-      const tl = y * width + x, tr = tl + 1, bl = (y + 1) * width + x, br = bl + 1;
-      if (indexMap[tl] !== -1 && indexMap[tr] !== -1 && indexMap[bl] !== -1 && indexMap[br] !== -1) quadCount++;
+      if (indexMap[tl] !== -1 && indexMap[tr] !== -1 && indexMap[bl] !== -1 && indexMap[br] !== -1) {
+        quadCount++;
+      }
     }
   }
 
-  const VERTS_PER_QUAD = 5;   // TL, BL, BR, TR, C
-  const TRIS_PER_QUAD  = 4;   // fan around center
+  // 4 triangles per quad, 3 vertices per triangle → 12 vertices per quad (no sharing — flat color & flat normal)
+  const TRIS_PER_QUAD = 4;
+  const VERTS_PER_TRI = 3;
+  const VERTS_PER_QUAD = TRIS_PER_QUAD * VERTS_PER_TRI; // 12
+
   const outPositions = new Float64Array(quadCount * VERTS_PER_QUAD * 3);
   const outColors    = new Uint8Array (quadCount * VERTS_PER_QUAD * 4);
   const outNormals   = new Float32Array(quadCount * VERTS_PER_QUAD * 3);
   const outIndices   = new Uint32Array(quadCount * TRIS_PER_QUAD  * 3);
 
-  let vtx = 0, idx = 0;
+  let vtx = 0;
+  let idx = 0;
 
-  function pushDup(srcIndex, r, g, b, a, nx, ny, nz) {
-    const pBase = srcIndex * 3, v3 = vtx * 3, c4 = vtx * 4;
-    outPositions[v3]     = positionsAll[pBase];
-    outPositions[v3 + 1] = positionsAll[pBase + 1];
-    outPositions[v3 + 2] = positionsAll[pBase + 2];
-
-    outNormals[v3]     = nx;
-    outNormals[v3 + 1] = ny;
-    outNormals[v3 + 2] = nz;
-
-    outColors[c4]     = r;
-    outColors[c4 + 1] = g;
-    outColors[c4 + 2] = b;
-    outColors[c4 + 3] = a;
-
-    return vtx++;
+  // Helper to read one grid vertex (lat,lon,h) & color from shared arrays by grid index
+  function getPos(i) {
+    const p = i * 3;
+    return [positionsGrid[p], positionsGrid[p+1], positionsGrid[p+2]]; // [lat, lon, h]
+  }
+  function getColor(i) {
+    const c = i * 4;
+    return [colorsGrid[c], colorsGrid[c+1], colorsGrid[c+2], colorsGrid[c+3]];
   }
 
-  function normAt(i) {
-    const b = i * 3;
-    return [sharedNormals[b], sharedNormals[b + 1], sharedNormals[b + 2]];
+  // Push one triangle with FLAT color & FLAT normal (duplicate 3 vertices)
+  function pushFlatTriangle(Pa, Pb, Pc, color) {
+    // Compute face normal in ENU
+    const aE = toENU(Pa[1], Pa[0], Pa[2]); // [lon,lat,h] → ENU; note Pa = [lat,lon,h]
+    const bE = toENU(Pb[1], Pb[0], Pb[2]);
+    const cE = toENU(Pc[1], Pc[0], Pc[2]);
+    const e1 = sub(bE, aE);
+    const e2 = sub(cE, aE);
+    const n  = normalize(cross(e1, e2));
+
+    // Write 3 duplicated vertices (positions in [lat,lon,h] to match your upstream)
+    for (const P of [Pa, Pb, Pc]) {
+      const o3 = vtx * 3;
+      const o4 = vtx * 4;
+
+      outPositions[o3]     = P[0];
+      outPositions[o3 + 1] = P[1];
+      outPositions[o3 + 2] = P[2];
+
+      outNormals[o3]       = n[0];
+      outNormals[o3 + 1]   = n[1];
+      outNormals[o3 + 2]   = n[2];
+
+      outColors[o4]        = color[0];
+      outColors[o4 + 1]    = color[1];
+      outColors[o4 + 2]    = color[2];
+      outColors[o4 + 3]    = color[3];
+
+      outIndices[idx++] = vtx;
+      vtx++;
+    }
   }
 
+  // Build triangles
   for (let y = 0; y < height - 1; y++) {
     for (let x = 0; x < width - 1; x++) {
-      const tl = y * width + x, tr = tl + 1, bl = (y + 1) * width + x, br = bl + 1;
+      const tl = y * width + x;
+      const tr = tl + 1;
+      const bl = (y + 1) * width + x;
+      const br = bl + 1;
+
       const iTL = indexMap[tl], iTR = indexMap[tr], iBL = indexMap[bl], iBR = indexMap[br];
       if (iTL === -1 || iTR === -1 || iBL === -1 || iBR === -1) continue;
 
-      // Per-cell flat color from TL
-      const cBase = iTL * 4;
-      const r = colorsAll[cBase]     ?? 200;
-      const g = colorsAll[cBase + 1] ?? 200;
-      const b = colorsAll[cBase + 2] ?? 200;
-      const a = colorsAll[cBase + 3] ?? 255;
+      // Corners
+      const PTL = getPos(iTL);
+      const PTR = getPos(iTR);
+      const PBL = getPos(iBL);
+      const PBR = getPos(iBR);
 
-      // Corner normals from shared grid (smooth across cells)
-      const nTL = normAt(iTL), nTR = normAt(iTR), nBL = normAt(iBL), nBR = normAt(iBR);
+      // Center = average of 4 corners in [lat,lon,h]
+      const C = [
+        (PTL[0] + PTR[0] + PBL[0] + PBR[0]) * 0.25,
+        (PTL[1] + PTR[1] + PBL[1] + PBR[1]) * 0.25,
+        (PTL[2] + PTR[2] + PBL[2] + PBR[2]) * 0.25
+      ];
 
-      // Corner duplicates (positions duplicated, normals copied from shared)
-      const vTL = pushDup(iTL, r, g, b, a, nTL[0], nTL[1], nTL[2]);
-      const vBL = pushDup(iBL, r, g, b, a, nBL[0], nBL[1], nBL[2]);
-      const vBR = pushDup(iBR, r, g, b, a, nBR[0], nBR[1], nBR[2]);
-      const vTR = pushDup(iTR, r, g, b, a, nTR[0], nTR[1], nTR[2]);
+      // Flat color per cell from TL (keep your existing look)
+      const color = getColor(iTL);
 
-      // Center vertex = avg of 4 corners (pos + normal)
-      const tlP = iTL * 3, blP = iBL * 3, brP = iBR * 3, trP = iTR * 3;
-      const cLat = (positionsAll[tlP] + positionsAll[blP] + positionsAll[brP] + positionsAll[trP]) * 0.25;
-      const cLon = (positionsAll[tlP + 1] + positionsAll[blP + 1] + positionsAll[brP + 1] + positionsAll[trP + 1]) * 0.25;
-      const cH   = (positionsAll[tlP + 2] + positionsAll[blP + 2] + positionsAll[brP + 2] + positionsAll[trP + 2]) * 0.25;
-
-      const nxC = (nTL[0] + nTR[0] + nBL[0] + nBR[0]) * 0.25;
-      const nyC = (nTL[1] + nTR[1] + nBL[1] + nBR[1]) * 0.25;
-      const nzC = (nTL[2] + nTR[2] + nBL[2] + nBR[2]) * 0.25;
-      const cNorm = normalize3(nxC, nyC, nzC);
-
-      const vC = vtx;
-      const v3 = vC * 3, c4 = vC * 4;
-      outPositions[v3]     = cLat;
-      outPositions[v3 + 1] = cLon;
-      outPositions[v3 + 2] = cH;
-      outNormals[v3]       = cNorm[0];
-      outNormals[v3 + 1]   = cNorm[1];
-      outNormals[v3 + 2]   = cNorm[2];
-      outColors[c4]        = r;
-      outColors[c4 + 1]    = g;
-      outColors[c4 + 2]    = b;
-      outColors[c4 + 3]    = a;
-      vtx++;
-
-      // Fan (counter-clockwise): (C, TL, BL), (C, BL, BR), (C, BR, TR), (C, TR, TL)
-      outIndices[idx++] = vC;  outIndices[idx++] = vTL; outIndices[idx++] = vBL;
-      outIndices[idx++] = vC;  outIndices[idx++] = vBL; outIndices[idx++] = vBR;
-      outIndices[idx++] = vC;  outIndices[idx++] = vBR; outIndices[idx++] = vTR;
-      outIndices[idx++] = vC;  outIndices[idx++] = vTR; outIndices[idx++] = vTL;
+      // Fan triangles (counter-clockwise for consistent normals):
+      // (C, TL, BL), (C, BL, BR), (C, BR, TR), (C, TR, TL)
+      pushFlatTriangle(C, PTL, PBL, color);
+      pushFlatTriangle(C, PBL, PBR, color);
+      pushFlatTriangle(C, PBR, PTR, color);
+      pushFlatTriangle(C, PTR, PTL, color);
     }
   }
 
   return { outPositions, outColors, outIndices, outNormals };
 }
 
-// --------------- worker ---------------
+// ---------- worker ----------
 self.onmessage = async (e) => {
   const { id, type, payload } = e.data || {};
   try {
     if (type !== 'PROCESS_TIFF') throw new Error(`Unknown worker message type: ${type}`);
-
     const { arrayBuffer, deltaZ = 0 } = payload;
 
     const tiff    = await GeoTIFF.fromArrayBuffer(arrayBuffer);
     const image   = await tiff.getImage();
-    const rasters = await image.readRasters(); // expect [0]=elev, [1]=R, [2]=G, [3]=B when available
+    const rasters = await image.readRasters(); // [0]=elev, [1]=R, [2]=G, [3]=B (if present)
     const width   = image.getWidth();
     const height  = image.getHeight();
 
     const bboxSrc = image.getBoundingBox(); // [minX, minY, maxX, maxY] in source CRS
-    const isWM = bboxIsWebMercator(bboxSrc);
+    const isWM    = bboxIsWebMercator(bboxSrc);
 
     const minX = bboxSrc[0], minY = bboxSrc[1], maxX = bboxSrc[2], maxY = bboxSrc[3];
     const stepX = (maxX - minX) / (width  - 1 || 1);
@@ -212,50 +191,51 @@ self.onmessage = async (e) => {
     const G = hasRGB ? rasters[2] : null;
     const B = hasRGB ? rasters[3] : null;
 
-    // Shared grid data
-    const positions = []; // [lat, lon, h] (lon/lat in degrees)
-    const colors    = []; // RGBA
+    // Shared grid: store only valid samples; indexMap maps image grid -> dense arrays
+    const positions = []; // [lat,lon,h]
+    const colors    = []; // [r,g,b,a]
     const indexMap  = new Int32Array(width * height);
     indexMap.fill(-1);
 
-    let nextIdx = 0;
+    // Tile center in lon/lat (used only for ENU normal calc)
+    let lon0, lat0;
+    if (isWM) {
+      const midX = 0.5 * (minX + maxX);
+      const midY = 0.5 * (minY + maxY);
+      [lon0, lat0] = webMercatorToLonLat(midX, midY);
+    } else {
+      lon0 = 0.5 * (minX + maxX);
+      lat0 = 0.5 * (minY + maxY);
+    }
 
+    let nextIdx = 0;
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < width; x++) {
         const i = y * width + x;
-
-        // Sample source coords
+        // source coords → lon/lat
         const srcX = minX + x * stepX;
         const srcY = maxY - y * stepY;
-
-        // Convert to lon/lat if bbox is Web Mercator, else assume degrees already
         let lon, lat;
         if (isWM) {
-          const ll = webMercatorToLonLat(srcX, srcY);
-          lon = ll[0]; lat = ll[1];
+          [lon, lat] = webMercatorToLonLat(srcX, srcY);
         } else {
-          lon = srcX;  lat = srcY;
+          lon = srcX; lat = srcY;
         }
 
-        // Elevation and color
+        // elevation & color
         let h = elev ? Number(elev[i]) : 0;
-        let r = hasRGB ? Number(R[i]) : 200;
-        let g = hasRGB ? Number(G[i]) : 200;
-        let b = hasRGB ? Number(B[i]) : 200;
-        let a = 255;
-
         if (h === NODATA_ELEV || h === 0) {
-          // Treat as "no elev" → hole; keep color light/transparent if you visualize point cloud
-          h = 0;
-          a = 100;
-          r = 255; g = 255; b = 255;
-          // We SKIP adding this vertex to the shared grid (keeps holes so world terrain shows through)
+          // skip holes so base terrain can show through
           continue;
         }
-
         h += Number(deltaZ || 0);
 
-        positions.push(lat, lon, h);   // store as [lat, lon, h]
+        const r = hasRGB ? Number(R[i]) : 200;
+        const g = hasRGB ? Number(G[i]) : 200;
+        const b = hasRGB ? Number(B[i]) : 200;
+        const a = 255;
+
+        positions.push(lat, lon, h);     // store as [lat,lon,h]
         colors.push(r, g, b, a);
         indexMap[i] = nextIdx++;
       }
@@ -264,15 +244,11 @@ self.onmessage = async (e) => {
     const posArr = new Float64Array(positions);
     const colArr = new Uint8Array(colors);
 
-    // Smooth normals on SHARED grid (two-tri per cell, shared vertices)
-    const idxShared = buildSharedGridIndices(indexMap, width, height);
-    const sharedNormals = computeNormals(posArr, idxShared);
-
-    // Emit center-fan with flat per-cell color but smooth normals copied in
+    // Build center-connected triangles with flat color & face normals
     const { outPositions, outColors, outIndices, outNormals } =
-      buildCenterFanWithSmoothNormals(posArr, colArr, sharedNormals, indexMap, width, height);
+      buildCenterFanFlatTri(posArr, colArr, indexMap, width, height, lon0, lat0);
 
-    // Also provide a WGS84 bbox for convenience if source was Web Mercator
+    // Optional: provide WGS84 bbox when source was Web Mercator
     let bboxWGS84 = null;
     if (isWM) {
       const llMin = webMercatorToLonLat(minX, minY);
@@ -286,8 +262,8 @@ self.onmessage = async (e) => {
       result: {
         width,
         height,
-        bboxSource: bboxSrc,      // original image bbox (source CRS)
-        bboxWGS84: bboxWGS84,     // filled if source was 3857
+        bboxSource: bboxSrc,
+        bboxWGS84,
         positions: outPositions.buffer, // Float64Array
         colors:    outColors.buffer,    // Uint8Array
         indices:   outIndices.buffer,   // Uint32Array
@@ -296,10 +272,6 @@ self.onmessage = async (e) => {
     }, [outPositions.buffer, outColors.buffer, outIndices.buffer, outNormals.buffer]);
 
   } catch (err) {
-    self.postMessage({
-      id,
-      ok: false,
-      error: (err && err.message) || String(err)
-    });
+    self.postMessage({ id, ok: false, error: (err && err.message) || String(err) });
   }
 };
