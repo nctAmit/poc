@@ -93,36 +93,30 @@ function computeNormals(positions, indices) {
   return normals;
 }
 
-// ----------------- Flat-color center-lattice mesh -----------------
-function buildFlatTriangleMeshFromCenters({
+// ---------- Center-lattice (no overlaps at tile seams) ----------
+function buildFlatTriangleMeshFromCenters_NoOverlap({
   width, height,
   minLon, maxLon, minLat, maxLat,
   elev, R, G, B, A,
   zExaggeration,
   treatZeroAsNoData,
-  hsGrid, shadeStrength
+  hsGrid, shadeStrength,
+  halfOpenEdges = true // skip last col/row of center-quads to avoid duplicates w/ neighbors
 }) {
-  // centers grid size
-  const cw = width - 1;
-  const ch = height - 1;
-  if (cw <= 0 || ch <= 0) {
-    return {
-      positions: new Float64Array(0),
-      colors: new Uint8Array(0),
-      indices: new Uint32Array(0),
-    };
+  const cw = width - 1, ch = height - 1; // centers = cw*ch
+  if (cw <= 1 || ch <= 1) {
+    return { positions: new Float64Array(0), colors: new Uint8Array(0), indices: new Uint32Array(0) };
   }
 
   const lonStep = (maxLon - minLon) / (width - 1 || 1);
   const latStep = (maxLat - minLat) / (height - 1 || 1);
-
-  const idx = (x, y) => y * width + x;
+  const idx  = (x, y) => y * width + x;
   const cidx = (x, y) => y * cw + x;
 
-  // Precompute each center's height & color (avg of 4 corners), and validity
-  const centerH = new Float64Array(cw * ch);
-  const centerColor = new Uint8Array(cw * ch * 4);
-  const centerValid = new Uint8Array(cw * ch);
+  // Precompute valid centers (need 4 corner samples)
+  const cH = new Float64Array(cw * ch);
+  const cRGBA = new Uint8Array(cw * ch * 4);
+  const cValid = new Uint8Array(cw * ch);
 
   for (let y = 0; y < ch; y++) {
     for (let x = 0; x < cw; x++) {
@@ -135,126 +129,100 @@ function buildFlatTriangleMeshFromCenters({
         !(treatZeroAsNoData && (hTL === 0 || hTR === 0 || hBL === 0 || hBR === 0));
 
       const ci = cidx(x, y);
+      cValid[ci] = valid ? 1 : 0;
 
-      if (!valid) {
-        centerValid[ci] = 0;
-        centerH[ci] = 0;
-        continue;
+      if (valid) {
+        cH[ci] = ((hTL + hTR + hBL + hBR) * 0.25) * zExaggeration;
+
+        const r = ((R[tl] + R[tr] + R[bl] + R[br]) * 0.25) | 0;
+        const g = ((G[tl] + G[tr] + G[bl] + G[br]) * 0.25) | 0;
+        const b = ((B[tl] + B[tr] + B[bl] + B[br]) * 0.25) | 0;
+        const a = A ? ((A[tl] + A[tr] + A[bl] + A[br]) * 0.25) | 0 : 255;
+
+        const o = ci * 4;
+        cRGBA[o] = r; cRGBA[o + 1] = g; cRGBA[o + 2] = b; cRGBA[o + 3] = a;
       }
-
-      centerValid[ci] = 1;
-      centerH[ci] = ((hTL + hTR + hBL + hBR) * 0.25) * zExaggeration;
-
-      // Averaged center color from GeoTIFF RGB(A)
-      const r = ((R[tl] + R[tr] + R[bl] + R[br]) * 0.25) | 0;
-      const g = ((G[tl] + G[tr] + G[bl] + G[br]) * 0.25) | 0;
-      const b = ((B[tl] + B[tr] + B[bl] + B[br]) * 0.25) | 0;
-      const a = A ? ((A[tl] + A[tr] + A[bl] + A[br]) * 0.25) | 0 : 255;
-
-      const o = ci * 4;
-      centerColor[o] = r; centerColor[o + 1] = g; centerColor[o + 2] = b; centerColor[o + 3] = a;
     }
   }
 
-  // Helper: center position (lat,lon,h)
+  // helpers for center pos/color
   function centerPos(x, y) {
     const latC = ((maxLat - y * latStep) + (maxLat - (y + 1) * latStep)) * 0.5;
     const lonC = ((minLon + x * lonStep) + (minLon + (x + 1) * lonStep)) * 0.5;
-    const h = centerH[cidx(x, y)];
+    const h = cH[cidx(x, y)];
     return [latC, lonC, h];
   }
-
-  // Helper: center RGBA
   function centerRGBA(x, y) {
     const o = cidx(x, y) * 4;
-    return [
-      centerColor[o],
-      centerColor[o + 1],
-      centerColor[o + 2],
-      centerColor[o + 3],
-    ];
+    return [cRGBA[o], cRGBA[o + 1], cRGBA[o + 2], cRGBA[o + 3]];
   }
 
-  // Optional: uniform shading modulation per triangle center
-  function modulateRGBA(r, g, b, x0, y0, x1, y1, x2, y2) {
+  // optional uniform shading modulation per-triangle (use centroid in center-grid)
+  function modulateRGB(r, g, b, cx, cy) {
     if (!shadeStrength || !hsGrid) return [r, g, b];
-    const s = clamp01(shadeStrength);
+    const s = Math.max(0, Math.min(1, shadeStrength));
 
-    // Triangle center in grid indices space → approximate by averaging the three *corner sample* hillshades closest to centers
-    // Pick nearest 4 corner samples around each involved center and average all 12 -> or simpler: average the 4 samples of the cell nearest to the tri centroid.
-    const cx = (x0 + x1 + x2) / 3;
-    const cy = (y0 + y1 + y2) / 3;
-
-    // Map centroid (in center grid) back to nearest raster sample block around floor(cx), floor(cy)
-    const gx = Math.max(0, Math.min(width - 2, Math.floor(cx)));
+    // map centroid to nearest raster 2×2 block
+    const gx = Math.max(0, Math.min(width  - 2, Math.floor(cx)));
     const gy = Math.max(0, Math.min(height - 2, Math.floor(cy)));
-
     const tl = idx(gx, gy), tr = idx(gx + 1, gy), bl = idx(gx, gy + 1), br = idx(gx + 1, gy + 1);
     const hs = (hsGrid[tl] + hsGrid[tr] + hsGrid[bl] + hsGrid[br]) * 0.25; // 0..1
-
-    const lit = hs * 255;
-    const nr = clamp255((1 - s) * r + s * lit);
-    const ng = clamp255((1 - s) * g + s * lit);
-    const nb = clamp255((1 - s) * b + s * lit);
-    return [nr, ng, nb];
+    const lit = (hs * 255) | 0;
+    return [clamp255((1 - s) * r + s * lit), clamp255((1 - s) * g + s * lit), clamp255((1 - s) * b + s * lit)];
   }
 
-  // Count triangles first (valid 2x2 blocks of centers → 2 tris)
+  // Decide iteration bounds for 2×2 blocks of centers
+  const maxX = halfOpenEdges ? (cw - 1) : (cw - 0);
+  const maxY = halfOpenEdges ? (ch - 1) : (ch - 0);
+
+  // Count triangles (2 per valid 2×2 block of centers)
   let triCount = 0;
-  for (let y = 0; y < ch - 1; y++) {
-    for (let x = 0; x < cw - 1; x++) {
-      const v00 = centerValid[cidx(x, y)];
-      const v10 = centerValid[cidx(x + 1, y)];
-      const v01 = centerValid[cidx(x, y + 1)];
-      const v11 = centerValid[cidx(x + 1, y + 1)];
-      if (v00 && v10 && v01 && v11) triCount += 2;
+  for (let y = 0; y < maxY - 1; y++) {
+    for (let x = 0; x < maxX - 1; x++) {
+      if (cValid[cidx(x, y)] && cValid[cidx(x + 1, y)] && cValid[cidx(x, y + 1)] && cValid[cidx(x + 1, y + 1)]) {
+        triCount += 2;
+      }
     }
   }
 
-  // Allocate non-indexed-style buffers but keep indices for consistency (0..n-1)
-  // We will duplicate vertices per triangle (flat color)
-  const positions = new Float64Array(triCount * 3 * 3); // triCount * 3 verts * 3 comps
-  const colors    = new Uint8Array (triCount * 3 * 4);  // triCount * 3 verts * RGBA
-  const indices   = new Uint32Array(triCount * 3);      // 0..N-1
+  const positions = new Float64Array(triCount * 3 * 3);
+  const colors    = new Uint8Array (triCount * 3 * 4);
+  const indices   = new Uint32Array(triCount * 3);
 
-  let vPtr = 0; // vertex cursor (float triplets)
-  let cPtr = 0; // color cursor (rgba quads)
-  let iPtr = 0; // index cursor
-  let vStart = 0;
+  let vPtr = 0, cPtr = 0, iPtr = 0, vStart = 0;
 
-  // Build triangles; for each, compute ONE color and assign to all 3 duplicated verts
-  for (let y = 0; y < ch - 1; y++) {
-    for (let x = 0; x < cw - 1; x++) {
-      const validBlock =
-        centerValid[cidx(x, y)] &&
-        centerValid[cidx(x + 1, y)] &&
-        centerValid[cidx(x, y + 1)] &&
-        centerValid[cidx(x + 1, y + 1)];
+  // Build triangles across 2×2 center blocks (consistent diagonal)
+  for (let y = 0; y < maxY - 1; y++) {
+    for (let x = 0; x < maxX - 1; x++) {
+      const v00 = cValid[cidx(x, y)];
+      const v10 = cValid[cidx(x + 1, y)];
+      const v01 = cValid[cidx(x, y + 1)];
+      const v11 = cValid[cidx(x + 1, y + 1)];
+      if (!(v00 && v10 && v01 && v11)) continue;
 
-      if (!validBlock) continue;
+      const p00 = centerPos(x, y);
+      const p10 = centerPos(x + 1, y);
+      const p01 = centerPos(x, y + 1);
+      const p11 = centerPos(x + 1, y + 1);
 
-      // Tri 1: (v00, v10, v11)
+      let c00 = centerRGBA(x, y);
+      let c10 = centerRGBA(x + 1, y);
+      let c01 = centerRGBA(x, y + 1);
+      let c11 = centerRGBA(x + 1, y + 1);
+
+      // Triangle 1: (00, 10, 11)
       {
-        const [lat0, lon0, h0] = centerPos(x, y);
-        const [lat1, lon1, h1] = centerPos(x + 1, y);
-        const [lat2, lon2, h2] = centerPos(x + 1, y + 1);
+        let r = ((c00[0] + c10[0] + c11[0]) / 3) | 0;
+        let g = ((c00[1] + c10[1] + c11[1]) / 3) | 0;
+        let b = ((c00[2] + c10[2] + c11[2]) / 3) | 0;
+        let a = ((c00[3] + c10[3] + c11[3]) / 3) | 0;
 
-        // Average the three centers' colors → flat triangle color
-        let [r0, g0, b0, a0] = centerRGBA(x, y);
-        let [r1, g1, b1, a1] = centerRGBA(x + 1, y);
-        let [r2, g2, b2, a2] = centerRGBA(x + 1, y + 1);
+        // centroid in center-grid coords
+        [r, g, b] = modulateRGB(r, g, b, x + (2/3), y + (1/3)); // rough centroid of (00,10,11)
 
-        let r = ((r0 + r1 + r2) / 3) | 0;
-        let g = ((g0 + g1 + g2) / 3) | 0;
-        let b = ((b0 + b1 + b2) / 3) | 0;
-        let a = ((a0 + a1 + a2) / 3) | 0;
-
-        // Optional uniform shading at triangle center
-        [r, g, b] = modulateRGBA(r, g, b, x, y, x + 1, y, x + 1, y + 1);
-
-        positions[vPtr++] = lat0; positions[vPtr++] = lon0; positions[vPtr++] = h0;
-        positions[vPtr++] = lat1; positions[vPtr++] = lon1; positions[vPtr++] = h1;
-        positions[vPtr++] = lat2; positions[vPtr++] = lon2; positions[vPtr++] = h2;
+        positions[vPtr++] = p00[0]; positions[vPtr++] = p00[1]; positions[vPtr++] = p00[2];
+        positions[vPtr++] = p10[0]; positions[vPtr++] = p10[1]; positions[vPtr++] = p10[2];
+        positions[vPtr++] = p11[0]; positions[vPtr++] = p11[1]; positions[vPtr++] = p11[2];
 
         colors[cPtr++] = r; colors[cPtr++] = g; colors[cPtr++] = b; colors[cPtr++] = a;
         colors[cPtr++] = r; colors[cPtr++] = g; colors[cPtr++] = b; colors[cPtr++] = a;
@@ -265,26 +233,18 @@ function buildFlatTriangleMeshFromCenters({
         indices[iPtr++] = vStart++;
       }
 
-      // Tri 2: (v00, v11, v01)
+      // Triangle 2: (00, 11, 01)
       {
-        const [lat0, lon0, h0] = centerPos(x, y);
-        const [lat1, lon1, h1] = centerPos(x + 1, y + 1);
-        const [lat2, lon2, h2] = centerPos(x, y + 1);
+        let r = ((c00[0] + c11[0] + c01[0]) / 3) | 0;
+        let g = ((c00[1] + c11[1] + c01[1]) / 3) | 0;
+        let b = ((c00[2] + c11[2] + c01[2]) / 3) | 0;
+        let a = ((c00[3] + c11[3] + c01[3]) / 3) | 0;
 
-        let [r0, g0, b0, a0] = centerRGBA(x, y);
-        let [r1, g1, b1, a1] = centerRGBA(x + 1, y + 1);
-        let [r2, g2, b2, a2] = centerRGBA(x, y + 1);
+        [r, g, b] = modulateRGB(r, g, b, x + (1/3), y + (2/3)); // rough centroid of (00,11,01)
 
-        let r = ((r0 + r1 + r2) / 3) | 0;
-        let g = ((g0 + g1 + g2) / 3) | 0;
-        let b = ((b0 + b1 + b2) / 3) | 0;
-        let a = ((a0 + a1 + a2) / 3) | 0;
-
-        [r, g, b] = modulateRGBA(r, g, b, x, y, x + 1, y + 1, x, y + 1);
-
-        positions[vPtr++] = lat0; positions[vPtr++] = lon0; positions[vPtr++] = h0;
-        positions[vPtr++] = lat1; positions[vPtr++] = lon1; positions[vPtr++] = h1;
-        positions[vPtr++] = lat2; positions[vPtr++] = lon2; positions[vPtr++] = h2;
+        positions[vPtr++] = p00[0]; positions[vPtr++] = p00[1]; positions[vPtr++] = p00[2];
+        positions[vPtr++] = p11[0]; positions[vPtr++] = p11[1]; positions[vPtr++] = p11[2];
+        positions[vPtr++] = p01[0]; positions[vPtr++] = p01[1]; positions[vPtr++] = p01[2];
 
         colors[cPtr++] = r; colors[cPtr++] = g; colors[cPtr++] = b; colors[cPtr++] = a;
         colors[cPtr++] = r; colors[cPtr++] = g; colors[cPtr++] = b; colors[cPtr++] = a;
@@ -299,7 +259,6 @@ function buildFlatTriangleMeshFromCenters({
 
   return { positions, colors, indices };
 }
-
 // ----------------- Worker entry -----------------
 self.onmessage = async (e) => {
   const { id, type, payload } = e.data || {};
@@ -358,3 +317,4 @@ self.onmessage = async (e) => {
     self.postMessage({ id, ok: false, error: (err && err.message) || String(err) });
   }
 };
+
